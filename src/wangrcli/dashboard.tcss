@@ -1,0 +1,567 @@
+Screen {
+    background: $surface;
+}
+
+Header {
+    background: $primary;
+    color: $text;
+}
+
+Footer {
+    background: $panel;
+}
+
+MarketBrief {
+    height: 100%;
+    padding: 1 2;
+}
+
+CoinPrices {
+    height: auto;
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+CoinPrices HorizontalGroup {
+    height: auto;
+    align: center middle;
+}
+
+CoinPrices Label {
+    margin: 0 1;
+    padding: 0 1;
+    color: $text;
+}
+
+CoinPrices Digits {
+    margin: 0 2;
+    color: $success;
+}
+
+SentimentInfo {
+    height: auto;
+    border: solid $accent;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+SentimentInfo Label {
+    margin: 0 0 1 0;
+    color: $text;
+    width: 100%;
+    content-align: left top;
+}
+
+SentimentInfo Label:first-child {
+    text-style: bold;
+    color: $warning;
+}
+
+.summary-text {
+    text-style: italic;
+}
+
+.bullish-label {
+    text-style: bold;
+    color: $success;
+}
+
+.bearish-label {
+    text-style: bold;
+    color: $error;
+}
+
+.bullish-text {
+    color: $success;
+    text-style: italic;
+}
+
+.bearish-text {
+    color: $error;
+    text-style: italic;
+}
+
+.change-positive {
+    color: $success;
+}
+
+.change-negative {
+    color: $error;
+}
+
+/* Whales Screen */
+#whale-coins {
+    height: auto;
+    margin: 1 2;
+    align: center middle;
+}
+
+WhalesScreen #whale-content {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1 0;
+    height: auto;
+}
+
+.whale-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.whale-bar {
+    color: $success;
+    margin: 0 0 1 0;
+}
+
+.whale-metric {
+    color: $text;
+    margin: 0 0 1 0;
+}
+
+.whale-positions {
+    color: $warning;
+    margin: 1 0 0 0;
+}
+
+/* WOI Screen */
+.woi-container {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.woi-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.woi-summary {
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+.woi-bar {
+    color: $success;
+    margin: 0 0 1 0;
+}
+
+.woi-stats {
+    color: $text;
+    margin: 0 0 1 0;
+}
+
+.woi-wallets {
+    color: $warning;
+    margin: 1 0 0 0;
+}
+
+/* Liquidations Screen */
+.liq-container {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.liq-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.liq-summary {
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+.liq-bar {
+    color: $error;
+    margin: 0 0 1 0;
+}
+
+.liq-exchanges {
+    color: $text;
+    margin: 1 0 1 0;
+}
+
+.liq-largest {
+    color: $warning;
+    margin: 1 0 0 0;
+}
+
+/* Polymarket Screen */
+.poly-container {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.poly-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.poly-summary {
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+.poly-stats {
+    color: $text;
+    margin: 0 0 1 0;
+}
+
+.poly-bar {
+    color: $success;
+    margin: 0 0 1 0;
+}
+
+.poly-traders {
+    color: $warning;
+    margin: 1 0 0 0;
+}
+
+/* Arbitrage Screen */
+.arb-container {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.arb-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.arb-spot {
+    color: $success;
+    margin: 0 0 1 0;
+}
+
+.arb-futures {
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+.arb-dex {
+    color: $warning;
+    margin: 0;
+}
+
+/* Whales Full Screen */
+#whalefull-coins {
+    height: auto;
+    margin: 1 2;
+    align: center middle;
+}
+
+#whale-summary {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 0 2 1 2;
+    height: auto;
+}
+
+#whale-columns {
+    height: auto;
+}
+
+#whale-left-col {
+    width: 1fr;
+    height: auto;
+}
+
+#whale-right-col {
+    width: 1fr;
+    height: auto;
+    margin-left: 2;
+}
+
+.whale-section-header {
+    text-style: bold;
+    color: $accent;
+    margin: 1 0 0 0;
+}
+
+.whale-bar-stacked {
+    color: #50fa7b;
+    margin: 0;
+}
+
+.whale-metric {
+    margin: 1 0 0 0;
+}
+
+.coin-toggle {
+    width: 11;
+    margin: 0 1;
+    padding: 0 2;
+    border: solid $panel;
+    color: $text;
+    content-align: center middle;
+    transition: border 200ms, color 200ms, background 200ms;
+}
+
+.coin-toggle:hover {
+    border: solid $accent;
+    color: $accent;
+}
+
+.coin-toggle-active {
+    border: solid $primary;
+    color: $primary;
+    text-style: bold;
+    background: $primary 15%;
+}
+
+#whales-table {
+    height: 1fr;
+    margin: 0 2;
+}
+
+/* WOI Full Screen */
+#woi-summary {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 0 2 1 2;
+    height: auto;
+}
+
+#woi-columns {
+    height: auto;
+}
+
+#woi-left-col {
+    width: 1fr;
+    height: auto;
+}
+
+#woi-right-col {
+    width: 1fr;
+    height: auto;
+    margin-left: 2;
+}
+
+.woi-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.woi-section-header {
+    text-style: bold;
+    color: $accent;
+    margin: 1 0 0 0;
+}
+
+.woi-bar-stacked {
+    color: #50fa7b;
+    margin: 0;
+}
+
+.woi-leaderboard {
+    margin: 0;
+}
+
+#woi-table {
+    height: 1fr;
+    margin: 0 2;
+}
+
+#dashboard-grid {
+    layout: grid;
+    grid-size: 3;
+    grid-gutter: 1 2;
+    padding: 1 2;
+    width: 70%;
+}
+
+#dashboard-wrapper {
+    width: 100%;
+    height: 100%;
+    align: center top;
+}
+
+.dashboard-grid-full {
+    width: 100%;
+}
+
+.dashboard-loading {
+    width: 100%;
+    content-align: center middle;
+    color: $accent;
+    margin: 1 0;
+}
+
+/* Loading shimmer animation class */
+.loading-shimmer {
+    color: $text 50%;
+}
+
+/* Price tick flash animations */
+.tick-up {
+    color: $success;
+    text-style: bold;
+    transition: color 200ms;
+}
+
+.tick-down {
+    color: $error;
+    text-style: bold;
+    transition: color 200ms;
+}
+
+.tick-neutral {
+    transition: color 500ms;
+}
+
+.dashboard-grid-1 {
+    grid-size: 1;
+}
+
+.dashboard-grid-2 {
+    grid-size: 2;
+}
+
+.dashboard-grid-3 {
+    grid-size: 3;
+}
+
+.dashboard-card {
+    border: solid $panel;
+    padding: 1 2;
+    height: auto;
+    min-height: 9;
+    min-width: 32;
+    transition: border 200ms;
+}
+
+.dashboard-card.card-focused {
+    border: solid $primary;
+}
+
+.dashboard-card-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.dashboard-card-body {
+    color: $text;
+    margin: 0 0 1 0;
+    text-wrap: wrap;
+    min-height: 3;
+}
+
+.dashboard-card-action {
+    width: 100%;
+    height: 3;
+}
+
+SortModal {
+    align: center middle;
+}
+
+.sort-modal {
+    width: 60%;
+    max-width: 80;
+    height: auto;
+    border: solid $primary;
+    padding: 1 2;
+    background: $surface;
+}
+
+.sort-modal-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+#sort-direction {
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+#sort-list {
+    height: 12;
+    border: solid $panel;
+}
+
+/* Chat Screen */
+#chat-container {
+    height: 100%;
+    padding: 1 2;
+}
+
+#chat-log {
+    height: 1fr;
+    border: solid $primary;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+#chat-input {
+    height: 3;
+    border: solid $panel;
+    padding: 0 1;
+}
+
+#chat-status {
+    height: 1;
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+/* Loading Spinner Widget */
+LoadingSpinner {
+    text-align: center;
+    color: $accent;
+}
+
+/* Pulse Dot Widget */
+PulseDot {
+    width: 3;
+    color: $success;
+}
+
+/* Data Tables with subtle row hover */
+DataTable > .datatable--cursor {
+    background: $primary 25%;
+}
+
+DataTable > .datatable--header {
+    text-style: bold;
+    background: $surface-darken-1;
+}
+
+DataTable {
+    scrollbar-background: $panel;
+    scrollbar-color: $primary;
+}
+
+/* Sort Modal transitions */
+.sort-modal {
+    transition: background 200ms;
+}
+
+/* Smooth container transitions */
+.liq-container,
+.woi-container,
+.poly-container,
+.arb-container {
+    transition: border 200ms;
+}
+
+/* Button hover states */
+Button:hover {
+    background: $primary 80%;
+}
+
+Button:focus {
+    background: $primary;
+    text-style: bold;
+}

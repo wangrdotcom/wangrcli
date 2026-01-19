@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wangrcli"
+version = "0.1.0"
+description = "Terminal market dashboard."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "hatch>=1.16.2",
+    "plotille>=5.0.0",
+    "requests>=2.32.5",
+    "textual>=6.11.0",
+    "textual-dev>=1.8.0",
+]
+
+[project.scripts]
+wangrcli = "wangrcli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wangrcli"]
+include = [
+    "src/wangrcli/dashboard.tcss",
+    "src/wangrcli/styles.css",
+    "src/wangrcli/whales_btc.json",
+]
