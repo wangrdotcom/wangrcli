@@ -4,9 +4,9 @@ from textual.app import ComposeResult
 from textual.containers import Container
 from textual.widgets import Footer, Header, Label
 
-from wangrcli.base_screen import DataFetchingScreen
-from wangrcli.config import MILLION
-from wangrcli.utils import format_bar, safe_division
+from wangr.base_screen import DataFetchingScreen
+from wangr.config import MILLION
+from wangr.utils import format_bar, safe_division
 
 
 class LiquidationsScreen(DataFetchingScreen):

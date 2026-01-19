@@ -5,18 +5,18 @@ from textual.app import ComposeResult
 from textual.containers import Container
 from textual.widgets import Button, Footer, Header, Label, Static
 
-from wangrcli.arbitrage import ArbitrageScreen
-from wangrcli.base_screen import DataFetchingScreen
-from wangrcli.chat_screen import ChatScreen
-from wangrcli.config import MILLION
-from wangrcli.liquidations import LiquidationsScreen
-from wangrcli.market_brief import MarketBriefScreen
-from wangrcli.polymarket import PolymarketScreen
-from wangrcli.sparkline import mini_bar
-from wangrcli.utils import safe_division, safe_float
-from wangrcli.whales_full import WhalesFullScreen
-from wangrcli.widgets import LoadingSpinner
-from wangrcli.woi_full import WOIFullScreen
+from wangr.arbitrage import ArbitrageScreen
+from wangr.base_screen import DataFetchingScreen
+from wangr.chat_screen import ChatScreen
+from wangr.config import MILLION
+from wangr.liquidations import LiquidationsScreen
+from wangr.market_brief import MarketBriefScreen
+from wangr.polymarket import PolymarketScreen
+from wangr.sparkline import mini_bar
+from wangr.utils import safe_division, safe_float
+from wangr.whales_full import WhalesFullScreen
+from wangr.widgets import LoadingSpinner
+from wangr.woi_full import WOIFullScreen
 
 
 class DashboardCard(Container):

@@ -6,9 +6,9 @@ from textual.containers import Container, Horizontal
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, Label, Static
 
-from wangrcli.base_screen import DataFetchingScreen
-from wangrcli.config import MILLION, THOUSAND
-from wangrcli.utils import format_bar, safe_division, safe_float
+from wangr.base_screen import DataFetchingScreen
+from wangr.config import MILLION, THOUSAND
+from wangr.utils import format_bar, safe_division, safe_float
 
 
 class WhalesScreen(DataFetchingScreen):

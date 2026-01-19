@@ -14,7 +14,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, Static
 from textual.worker import Worker
 
-from wangrcli.config import (
+from wangr.config import (
     API_TIMEOUT,
     FETCH_INTERVAL,
     FRONTPAGE_API_URL,
@@ -22,9 +22,9 @@ from wangrcli.config import (
     THOUSAND,
     WOI_TRACKED_USERS_API_URL,
 )
-from wangrcli.sort_modal import SortModal
-from wangrcli.sparkline import mini_bar
-from wangrcli.utils import format_time, safe_division, safe_float
+from wangr.sort_modal import SortModal
+from wangr.sparkline import mini_bar
+from wangr.utils import format_time, safe_division, safe_float
 
 logger = logging.getLogger(__name__)
 

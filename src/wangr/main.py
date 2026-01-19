@@ -3,8 +3,8 @@ from pathlib import Path
 from textual.app import App
 from textual.worker import Worker
 
-from wangrcli.dashboard_screen import DashboardScreen
-from wangrcli.data import fetch_whales_full_data, fetch_woi_full_data
+from wangr.dashboard_screen import DashboardScreen
+from wangr.data import fetch_whales_full_data, fetch_woi_full_data
 
 
 class WangrApp(App):

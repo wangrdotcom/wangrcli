@@ -7,7 +7,7 @@ import requests
 from textual.screen import Screen
 from textual.worker import Worker
 
-from wangrcli.config import API_TIMEOUT, FETCH_INTERVAL, FRONTPAGE_API_URL
+from wangr.config import API_TIMEOUT, FETCH_INTERVAL, FRONTPAGE_API_URL
 
 logger = logging.getLogger(__name__)
 

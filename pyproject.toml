@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "wangrcli"
+name = "wangr"
 version = "0.1.0"
 description = "Terminal market dashboard."
 readme = "README.md"
@@ -18,12 +18,12 @@ dependencies = [
 ]
 
 [project.scripts]
-wangrcli = "wangrcli.main:main"
+wangr = "wangr.main:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/wangrcli"]
+packages = ["src/wangr"]
 include = [
-    "src/wangrcli/dashboard.tcss",
-    "src/wangrcli/styles.css",
-    "src/wangrcli/whales_btc.json",
+    "src/wangr/dashboard.tcss",
+    "src/wangr/styles.css",
+    "src/wangr/whales_btc.json",
 ]

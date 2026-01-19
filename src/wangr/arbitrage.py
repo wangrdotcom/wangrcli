@@ -4,7 +4,7 @@ from textual.app import ComposeResult
 from textual.containers import Container
 from textual.widgets import Footer, Header, Label
 
-from wangrcli.base_screen import DataFetchingScreen
+from wangr.base_screen import DataFetchingScreen
 
 
 class ArbitrageScreen(DataFetchingScreen):

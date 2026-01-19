@@ -3,7 +3,7 @@
 import logging
 from typing import Any
 
-from wangrcli.config import BAR_WIDTH, PRICE_FORMAT_THRESHOLD, THOUSAND
+from wangr.config import BAR_WIDTH, PRICE_FORMAT_THRESHOLD, THOUSAND
 
 logger = logging.getLogger(__name__)
 

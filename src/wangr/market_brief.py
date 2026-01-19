@@ -4,8 +4,8 @@ from textual.app import ComposeResult
 from textual.containers import Container, HorizontalGroup, VerticalScroll
 from textual.widgets import Digits, Footer, Header, Label
 
-from wangrcli.base_screen import DataFetchingScreen
-from wangrcli.utils import safe_float
+from wangr.base_screen import DataFetchingScreen
+from wangr.utils import safe_float
 
 
 class CoinPrices(Container):

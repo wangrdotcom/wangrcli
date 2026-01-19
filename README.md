@@ -1,11 +1,11 @@
-wangrcli
+wangr
 
 Terminal market dashboard.
 
 Install
 
-pip install wangrcli
+pip install wangr
 
 Run
 
-wangrcli
+wangr

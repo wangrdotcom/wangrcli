@@ -13,7 +13,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, Static
 from textual.worker import Worker
 
-from wangrcli.config import (
+from wangr.config import (
     API_TIMEOUT,
     BTC_WHALES_API_URL,
     ETH_WHALES_API_URL,
@@ -22,10 +22,10 @@ from wangrcli.config import (
     SOL_WHALES_API_URL,
     THOUSAND,
 )
-from wangrcli.hyperliquid import fetch_prices
-from wangrcli.sort_modal import SortModal
-from wangrcli.sparkline import mini_bar
-from wangrcli.utils import format_price, safe_division, safe_float
+from wangr.hyperliquid import fetch_prices
+from wangr.sort_modal import SortModal
+from wangr.sparkline import mini_bar
+from wangr.utils import format_price, safe_division, safe_float
 
 logger = logging.getLogger(__name__)
 

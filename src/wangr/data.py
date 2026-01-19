@@ -5,7 +5,7 @@ import logging
 
 import requests
 
-from wangrcli.config import (
+from wangr.config import (
     API_TIMEOUT,
     BTC_WHALES_API_URL,
     ETH_WHALES_API_URL,

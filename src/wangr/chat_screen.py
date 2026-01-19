@@ -12,8 +12,8 @@ from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, RichLog, Static
 from textual.worker import Worker
 
-from wangrcli.config import API_TIMEOUT, CHAT_API_URL
-from wangrcli.tools import LocalToolExecutor
+from wangr.config import API_TIMEOUT, CHAT_API_URL
+from wangr.tools import LocalToolExecutor
 
 logger = logging.getLogger(__name__)
 
