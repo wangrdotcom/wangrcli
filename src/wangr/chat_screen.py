@@ -1,7 +1,6 @@
 """Chat screen for Wangr agent."""
 
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +15,12 @@ from wangr.config import API_TIMEOUT, CHAT_API_URL
 from wangr.tools import LocalToolExecutor
 
 logger = logging.getLogger(__name__)
-
-# Set to True to test tool execution without backend changes
-SIMULATION_MODE = os.getenv("WANGR_CHAT_SIMULATION", "").lower() in {"1", "true", "yes", "on"}
+_LOG_FILE = Path.cwd() / "wangr_chat.log"
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(file_handler)
 
 
 class ChatScreen(Screen):
@@ -97,6 +99,10 @@ class ChatScreen(Screen):
             input_box.focus()
             self._stop_processing()
             response, tool_calls = event.worker.result
+            if tool_calls:
+                self._show_status_temp(f"Tool calls: {len(tool_calls)}")
+            else:
+                self._show_status_temp("No tool calls")
             self._append_assistant_message(response, tool_calls)
         elif event.state.name == "ERROR":
             input_box.disabled = False
@@ -106,22 +112,31 @@ class ChatScreen(Screen):
             self._append_system_message("Request failed.")
 
     def _chat_request(self, message: str) -> tuple[str, list[dict[str, Any]]]:
-        if SIMULATION_MODE:
-            return self._simulate_chat_with_tools(message)
         return self._real_chat_request(message)
 
     def _real_chat_request(self, message: str) -> tuple[str, list[dict[str, Any]]]:
-        """Real API request (when backend supports tool execution)."""
+        """Real API request with local apply_patch handling."""
         try:
-            response = requests.post(
-                CHAT_API_URL,
-                json={"message": message, "history": self._history},
-                timeout=API_TIMEOUT * 12,
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = self._post_chat({"message": message, "history": self._history})
             reply = data.get("response", "")
-            tool_calls = data.get("tool_calls", [])
+            tool_calls = data.get("tool_calls", []) or []
+            response_id = data.get("response_id")
+            if tool_calls:
+                tool_names = [
+                    call.get("name") or call.get("type", "tool")
+                    for call in tool_calls
+                ]
+                logger.info(
+                    "Chat response tool calls (%s): %s",
+                    len(tool_calls),
+                    ", ".join(tool_names),
+                )
+            else:
+                logger.info("Chat response had no tool calls")
+            if tool_calls:
+                followup_reply, tool_calls = self._process_tool_calls(tool_calls, response_id)
+                if followup_reply:
+                    reply = followup_reply
             self._history.append({"role": "user", "content": message})
             self._history.append({"role": "assistant", "content": reply})
             self._persist_state()
@@ -130,92 +145,139 @@ class ChatScreen(Screen):
             logger.error("Chat request failed: %s", exc)
             raise RuntimeError("chat request failed") from exc
 
-    def _simulate_chat_with_tools(self, message: str) -> tuple[str, list[dict[str, Any]]]:
-        """Simulate AI responses with tool calls for testing."""
-        msg_lower = message.lower()
-        tool_calls_executed: list[dict[str, Any]] = []
+    def _post_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = requests.post(
+            CHAT_API_URL,
+            json=payload,
+            timeout=API_TIMEOUT * 12,
+        )
+        response.raise_for_status()
+        logger.info("Chat API response: %s", response.text)
+        return response.json()
 
-        # Detect tool-triggering commands in the message
-        if "read " in msg_lower or "show " in msg_lower or "cat " in msg_lower:
-            # Extract filename - simple parsing
-            for word in message.split():
-                if "." in word and not word.startswith("."):
-                    tool_call = {
-                        "id": f"sim_{len(tool_calls_executed)}",
-                        "name": "read_file",
-                        "arguments": {"path": word.strip("\"'")},
+    def _process_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        response_id: str | None,
+        max_rounds: int = 5,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        reply = ""
+        all_calls: list[dict[str, Any]] = []
+        current_calls = tool_calls
+        current_response_id = response_id
+
+        for _ in range(max_rounds):
+            outputs, decorated_calls = self._handle_tool_calls(current_calls)
+            all_calls.extend(decorated_calls)
+            if not outputs:
+                break
+            payload: dict[str, Any] = {"history": self._history, "tool_outputs": outputs}
+            if current_response_id:
+                payload["previous_response_id"] = current_response_id
+            data = self._post_chat(payload)
+            reply = data.get("response", "")
+            current_calls = data.get("tool_calls", []) or []
+            current_response_id = data.get("response_id", current_response_id)
+            if not current_calls:
+                break
+
+        return reply, all_calls
+
+    def _handle_tool_calls(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        outputs: list[dict[str, Any]] = []
+        decorated_calls: list[dict[str, Any]] = []
+
+        for call in tool_calls:
+            operations, call_id = self._extract_apply_patch_operations(call)
+            if operations:
+                results = []
+                for operation in operations:
+                    ok, message = self._tool_executor.apply_patch_operation(operation)
+                    results.append((ok, message))
+                status = "completed" if all(ok for ok, _ in results) else "failed"
+                message = "\n".join(msg for _, msg in results)
+                tool_name = "apply_patch"
+            else:
+                status = "failed"
+                message = "Error: Unsupported tool call"
+                tool_name = call.get("name", "tool")
+
+            if call_id:
+                outputs.append(
+                    {
+                        "type": "apply_patch_call_output",
+                        "call_id": call_id,
+                        "status": status,
+                        "output": message,
                     }
-                    result = self._execute_tool(tool_call)
-                    tool_calls_executed.append({**tool_call, "result": result})
-                    break
+                )
 
-        elif "list " in msg_lower or "ls " in msg_lower or "files" in msg_lower:
-            pattern = "*"
-            if "*.py" in msg_lower:
-                pattern = "*.py"
-            elif "*.md" in msg_lower:
-                pattern = "*.md"
-            tool_call = {
-                "id": f"sim_{len(tool_calls_executed)}",
-                "name": "list_files",
-                "arguments": {"pattern": pattern, "path": "."},
-            }
-            result = self._execute_tool(tool_call)
-            tool_calls_executed.append({**tool_call, "result": result})
+            decorated = dict(call)
+            decorated["name"] = tool_name
+            decorated["status"] = status
+            decorated["result"] = message
+            decorated_calls.append(decorated)
 
-        elif "write " in msg_lower or "create " in msg_lower:
-            # Look for filename and content pattern
-            parts = message.split(":", 1)
-            if len(parts) == 2:
-                # Try to extract path from first part
-                path = None
-                for word in parts[0].split():
-                    if "." in word:
-                        path = word.strip("\"'")
-                        break
-                if path:
-                    content = parts[1].strip()
-                    tool_call = {
-                        "id": f"sim_{len(tool_calls_executed)}",
-                        "name": "write_file",
-                        "arguments": {"path": path, "content": content},
-                    }
-                    result = self._execute_tool(tool_call)
-                    tool_calls_executed.append({**tool_call, "result": result})
+        return outputs, decorated_calls
 
-        elif "edit " in msg_lower:
-            # This is harder to parse, provide guidance
-            return (
-                "[Simulation] To test edit_file, use format:\n"
-                "`edit <file>: old_string >>> new_string`",
-                []
-            )
+    @staticmethod
+    def _extract_apply_patch_operations(
+        call: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        call_id = call.get("call_id") or call.get("id")
+        if call.get("type") == "apply_patch_call":
+            operation = call.get("operation")
+            if operation:
+                return [operation], call_id
 
-        # Build response based on what was executed
-        if tool_calls_executed:
-            response_parts = ["[Simulation Mode] Executed tools:\n"]
-            for tc in tool_calls_executed:
-                response_parts.append(f"**{tc['name']}**({tc['arguments']})")
-                result_preview = tc["result"][:500] if len(tc["result"]) > 500 else tc["result"]
-                response_parts.append(f"```\n{result_preview}\n```\n")
-            return "\n".join(response_parts), tool_calls_executed
-        else:
-            # No tools detected, just echo
-            return (
-                f"[Simulation Mode] No tools triggered.\n\n"
-                f"Try commands like:\n"
-                f"- `read config.py`\n"
-                f"- `list *.py`\n"
-                f"- `create test.txt: hello world`\n\n"
-                f"Your message: {message}",
-                []
-            )
+        if call.get("name") == "apply_patch":
+            operation = call.get("operation")
+            if operation:
+                return [operation], call_id
+            arguments = call.get("arguments") or call.get("args") or {}
+            patch = arguments.get("patch") if isinstance(arguments, dict) else None
+            if patch:
+                return ChatScreen._parse_begin_patch(patch), call_id
 
-    def _execute_tool(self, tool_call: dict[str, Any]) -> str:
-        """Execute a single tool call locally."""
-        name = tool_call.get("name", "")
-        arguments = tool_call.get("arguments", {})
-        return self._tool_executor.execute(name, arguments)
+        return None, call_id
+
+    @staticmethod
+    def _parse_begin_patch(patch: str) -> list[dict[str, Any]]:
+        operations: list[dict[str, Any]] = []
+        lines = patch.splitlines()
+        idx = 0
+        while idx < len(lines):
+            line = lines[idx]
+            if line.startswith("*** Add File: "):
+                path = line.replace("*** Add File: ", "", 1).strip()
+                idx += 1
+                content_lines = []
+                while idx < len(lines) and not lines[idx].startswith("*** "):
+                    if lines[idx].startswith("+"):
+                        content_lines.append(lines[idx][1:])
+                    idx += 1
+                operations.append(
+                    {"type": "create_file", "path": path, "diff": "\n".join(content_lines)}
+                )
+                continue
+            if line.startswith("*** Update File: "):
+                path = line.replace("*** Update File: ", "", 1).strip()
+                idx += 1
+                diff_lines = []
+                while idx < len(lines) and not lines[idx].startswith("*** "):
+                    diff_lines.append(lines[idx])
+                    idx += 1
+                operations.append(
+                    {"type": "update_file", "path": path, "diff": "\n".join(diff_lines)}
+                )
+                continue
+            if line.startswith("*** Delete File: "):
+                path = line.replace("*** Delete File: ", "", 1).strip()
+                operations.append({"type": "delete_file", "path": path})
+            idx += 1
+        return operations
 
     def _append_user_message(self, message: str) -> None:
         self._entries.append({"role": "user", "content": message})

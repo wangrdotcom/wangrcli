@@ -198,3 +198,110 @@ class LocalToolExecutor:
             result.append(f"  ... and {len(matches) - max_results} more")
 
         return "\n".join(result)
+
+    def apply_patch_operation(self, operation: dict[str, Any]) -> tuple[bool, str]:
+        """Apply an apply_patch operation and return (success, message)."""
+        op_type = operation.get("type")
+        path = operation.get("path")
+        if not op_type or not path:
+            return False, "Error: Missing operation type or path"
+
+        file_path = self._resolve_path(path)
+        if not self._is_safe_path(file_path):
+            return False, f"Error: Path outside working directory: {path}"
+
+        if op_type == "create_file":
+            if file_path.exists():
+                return False, f"Error: File already exists: {path}"
+            diff = operation.get("diff", "")
+            try:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(diff, encoding="utf-8")
+            except OSError as exc:
+                return False, f"Error: Cannot create file: {exc}"
+            return True, f"Created {path}"
+
+        if op_type == "update_file":
+            if not file_path.exists():
+                return False, f"Error: File not found: {path}"
+            if not file_path.is_file():
+                return False, f"Error: Not a file: {path}"
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return False, f"Error: Cannot read binary file: {path}"
+            diff = operation.get("diff", "")
+            ok, result = self._apply_v4a_diff(content, diff)
+            if not ok:
+                return False, result
+            try:
+                file_path.write_text(result, encoding="utf-8")
+            except OSError as exc:
+                return False, f"Error: Cannot write file: {exc}"
+            return True, f"Updated {path}"
+
+        if op_type == "delete_file":
+            if not file_path.exists():
+                return False, f"Error: File not found: {path}"
+            if not file_path.is_file():
+                return False, f"Error: Not a file: {path}"
+            try:
+                file_path.unlink()
+            except OSError as exc:
+                return False, f"Error: Cannot delete file: {exc}"
+            return True, f"Deleted {path}"
+
+        return False, f"Error: Unsupported operation type: {op_type}"
+
+    def _apply_v4a_diff(self, content: str, diff: str) -> tuple[bool, str]:
+        """Apply a V4A-style diff to content and return (success, new_content_or_error)."""
+        if not diff:
+            return False, "Error: Empty diff"
+
+        diff_lines = diff.splitlines()
+        if not any(line.startswith("@@") for line in diff_lines):
+            return False, "Error: Unsupported diff format (missing @@ hunk headers)"
+
+        hunks: list[list[str]] = []
+        current: list[str] = []
+        for line in diff_lines:
+            if line.startswith("@@"):
+                if current:
+                    hunks.append(current)
+                    current = []
+                continue
+            if line.startswith("\\ No newline at end of file"):
+                continue
+            current.append(line)
+        if current:
+            hunks.append(current)
+
+        new_lines = content.splitlines()
+        for hunk in hunks:
+            old_chunk = [line[1:] for line in hunk if line.startswith(" ") or line.startswith("-")]
+            new_chunk = [line[1:] for line in hunk if line.startswith(" ") or line.startswith("+")]
+            if not old_chunk:
+                return False, "Error: Hunk has no context to match"
+            matches = self._find_sublist(new_lines, old_chunk)
+            if not matches:
+                return False, "Error: Hunk context not found"
+            if len(matches) > 1:
+                return False, "Error: Hunk context is not unique"
+            start = matches[0]
+            new_lines = new_lines[:start] + new_chunk + new_lines[start + len(old_chunk):]
+
+        new_content = "\n".join(new_lines)
+        if content.endswith("\n") and not new_content.endswith("\n"):
+            new_content += "\n"
+        return True, new_content
+
+    @staticmethod
+    def _find_sublist(haystack: list[str], needle: list[str]) -> list[int]:
+        if not needle:
+            return []
+        indices: list[int] = []
+        max_start = len(haystack) - len(needle)
+        for idx in range(max_start + 1):
+            if haystack[idx:idx + len(needle)] == needle:
+                indices.append(idx)
+        return indices
