@@ -1,10 +1,16 @@
 """Chat screen for Wangr agent."""
 
+import difflib
 import logging
 from pathlib import Path
 from typing import Any
 
 import requests
+from agents import apply_diff as agents_apply_diff
+from rich.console import Group
+from rich.syntax import Syntax
+from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.screen import Screen
@@ -41,6 +47,8 @@ class ChatScreen(Screen):
         self._processing_frame = 0
         self._pending_index: int | None = None
         self._tool_executor = LocalToolExecutor(working_directory=str(Path.cwd()))
+        self._pending_file_ops: dict[str, Any] | None = None
+        self._auto_approve_chain = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -80,6 +88,22 @@ class ChatScreen(Screen):
             return
         if self._worker and self._worker.is_running:
             return
+        if self._pending_file_ops:
+            normalized = message.lower()
+            if normalized not in {"y", "n"}:
+                self._show_status_temp("Please enter 'y' or 'n'.")
+                return
+            decision = normalized == "y"
+            event.input.value = ""
+            self._append_user_message(message)
+            event.input.disabled = True
+            self._start_processing()
+            self._worker = self.run_worker(
+                lambda: self._resolve_pending_request(decision),
+                thread=True,
+                name="chat_pending",
+            )
+            return
         event.input.value = ""
         self._append_user_message(message)
         event.input.disabled = True
@@ -95,8 +119,6 @@ class ChatScreen(Screen):
             return
         input_box = self.query_one("#chat-input", Input)
         if event.state.name == "SUCCESS":
-            input_box.disabled = False
-            input_box.focus()
             self._stop_processing()
             response, tool_calls = event.worker.result
             if tool_calls:
@@ -104,6 +126,12 @@ class ChatScreen(Screen):
             else:
                 self._show_status_temp("No tool calls")
             self._append_assistant_message(response, tool_calls)
+            if self._pending_file_ops:
+                input_box.disabled = True
+                self.focus()
+            else:
+                input_box.disabled = False
+                input_box.focus()
         elif event.state.name == "ERROR":
             input_box.disabled = False
             input_box.focus()
@@ -121,6 +149,12 @@ class ChatScreen(Screen):
             reply = data.get("response", "")
             tool_calls = data.get("tool_calls", []) or []
             response_id = data.get("response_id")
+            pending = data.get("pending_file_ops")
+            if pending:
+                self._pending_file_ops = pending
+                self._auto_approve_chain = False
+                prompt = self._prepare_pending_prompt(pending)
+                return prompt, []
             if tool_calls:
                 tool_names = [
                     call.get("name") or call.get("type", "tool")
@@ -154,6 +188,271 @@ class ChatScreen(Screen):
         response.raise_for_status()
         logger.info("Chat API response: %s", response.text)
         return response.json()
+
+    def _post_chat_continue(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = requests.post(
+            f"{CHAT_API_URL}/continue",
+            json=payload,
+            timeout=API_TIMEOUT * 12,
+        )
+        response.raise_for_status()
+        logger.info("Chat API continue response: %s", response.text)
+        return response.json()
+
+    def _resolve_pending_request(self, approved: bool) -> tuple[str, list[dict[str, Any]]]:
+        pending = self._pending_file_ops
+        if not pending:
+            return "No pending operations.", []
+        response, next_pending, auto_approved = self._resolve_pending(
+            pending, approved, self._auto_approve_chain
+        )
+        self._pending_file_ops = next_pending
+        self._auto_approve_chain = auto_approved
+        if self._pending_file_ops:
+            prompt = self._prepare_pending_prompt(self._pending_file_ops)
+            return prompt, []
+        return response, []
+
+    def _prepare_pending_prompt(self, pending: dict[str, Any]) -> str:
+        preview, approvable, _auto_outputs = self._categorize_patch_ops(pending)
+        if preview:
+            renderable = Group(Text("Proposed changes:", style="bold"), Syntax(preview, "diff"))
+            self._append_assistant_renderable(renderable, [])
+        elif approvable:
+            self._append_assistant_message("[dim]Proposed changes (no diff preview available).[/dim]", [])
+        if approvable:
+            return "Apply these changes? Press Y/N."
+        return "No approvable changes."
+
+    def on_key(self, event: events.Key) -> None:
+        if not self._pending_file_ops:
+            return
+        if self._worker and self._worker.is_running:
+            return
+        key = event.key.lower()
+        if key not in {"y", "n"}:
+            return
+        event.stop()
+        approved = key == "y"
+        input_box = self.query_one("#chat-input", Input)
+        input_box.value = ""
+        input_box.disabled = True
+        self._start_processing()
+        self._worker = self.run_worker(
+            lambda: self._resolve_pending_request(approved),
+            thread=True,
+            name="chat_pending",
+        )
+
+    def _resolve_pending(
+        self, pending: dict[str, Any], approved: bool, auto_approve_chain: bool
+    ) -> tuple[str, dict[str, Any] | None, bool]:
+        pending_id = pending.get("id")
+        operations = pending.get("operations", [])
+        if not pending_id:
+            raise ValueError("Missing pending operation id from server response.")
+
+        read_ops = [op for op in operations if op.get("type") == "read_file"]
+        patch_ops = [op for op in operations if op.get("type") == "apply_patch"]
+
+        outputs = []
+        auto_outputs = []
+
+        if read_ops:
+            outputs.extend(self._execute_read_ops(read_ops))
+
+        if patch_ops:
+            _preview, approvable, auto_outputs = self._categorize_patch_ops(pending)
+            outputs.extend(auto_outputs)
+
+            if approvable:
+                if approved or auto_approve_chain:
+                    outputs.extend(self._apply_patch_ops(approvable))
+                else:
+                    outputs.extend(self._deny_operations(approvable, "User denied apply_patch operation."))
+
+        data = self._post_chat_continue(
+            {"pending_id": pending_id, "tool_outputs": outputs}
+        )
+        response = data.get("response", "")
+        next_pending = data.get("pending_file_ops")
+        return response, next_pending, auto_approve_chain or (approved and bool(patch_ops) and not auto_outputs)
+
+    def _execute_read_ops(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        results = []
+        base_dir = Path.cwd()
+        for op in operations:
+            call_id = op.get("call_id")
+            path = op.get("path", "")
+            try:
+                content = self._read_local_file(path, base_dir)
+                results.append({
+                    "call_id": call_id,
+                    "status": "completed",
+                    "output": content,
+                })
+            except Exception as exc:
+                results.append({
+                    "call_id": call_id,
+                    "status": "failed",
+                    "output": f"Error reading file: {exc}",
+                })
+        return results
+
+    def _categorize_patch_ops(
+        self, pending: dict[str, Any]
+    ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+        previews = []
+        approvable = []
+        auto_outputs = []
+        base_dir = Path.cwd()
+
+        for op in pending.get("operations", []):
+            if op.get("type") != "apply_patch":
+                continue
+            call_id = op.get("call_id")
+            operation = op.get("operation", op)
+            op_type = operation.get("type")
+            try:
+                diff = self._preview_operation(operation, base_dir)
+                if diff:
+                    previews.append(diff)
+                    approvable.append(op)
+                elif op_type in {"create_file", "delete_file"}:
+                    approvable.append(op)
+            except Exception as exc:
+                path = operation.get("path", "<unknown>")
+                auto_outputs.append({
+                    "call_id": call_id,
+                    "status": "failed",
+                    "output": f"Preview error for {path}: {exc}",
+                })
+
+        return "\n\n".join(previews), approvable, auto_outputs
+
+    def _apply_patch_ops(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        results = []
+        base_dir = Path.cwd()
+        for op in operations:
+            call_id = op.get("call_id")
+            operation = op.get("operation", op)
+            success, output = self._apply_operation(operation, base_dir)
+            results.append({
+                "call_id": call_id,
+                "status": "completed" if success else "failed",
+                "output": output,
+            })
+        return results
+
+    def _deny_operations(self, operations: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+        return [{
+            "call_id": op.get("call_id"),
+            "status": "failed",
+            "output": reason,
+        } for op in operations]
+
+    def _sanitize_diff(self, diff: str) -> str:
+        lines = []
+        for line in diff.splitlines():
+            if line.startswith("*** Begin Patch") or line.startswith("*** End Patch"):
+                continue
+            if line.startswith("*** Update File") or line.startswith("*** Add File") or line.startswith("*** Delete File"):
+                continue
+            if line.startswith("diff --git") or line.startswith("index "):
+                continue
+            if line.startswith("--- ") or line.startswith("+++ "):
+                continue
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _apply_diff(self, input_text: str, diff: str, mode: str = "default") -> str:
+        return agents_apply_diff(input_text, self._sanitize_diff(diff), mode)
+
+    def _normalize_operation(self, operation: dict[str, Any]) -> dict[str, Any]:
+        if "operation" in operation and isinstance(operation["operation"], dict):
+            operation = operation["operation"]
+        op_type = operation.get("type")
+        path = operation.get("path")
+        if not op_type or not path:
+            raise ValueError("Operation must include 'type' and 'path'.")
+        return {"type": op_type, "path": path, "diff": operation.get("diff")}
+
+    def _resolve_path(self, base_dir: Path, path: str) -> Path:
+        candidate = Path(path)
+        if candidate.is_absolute():
+            raise ValueError("Absolute paths are not allowed.")
+        resolved = (base_dir / candidate).resolve()
+        if not resolved.is_relative_to(base_dir.resolve()):
+            raise ValueError("Path escapes the workspace root.")
+        return resolved
+
+    def _preview_operation(self, operation: dict[str, Any], base_dir: Path) -> str:
+        op = self._normalize_operation(operation)
+        target = self._resolve_path(base_dir, op["path"])
+        if op["type"] == "delete_file":
+            if not target.exists():
+                raise ValueError(f"File not found: {op['path']}")
+            old_content = target.read_text()
+            new_content = ""
+        elif op["type"] == "create_file":
+            if target.exists():
+                raise ValueError(f"File already exists: {op['path']}")
+            old_content = ""
+            new_content = self._apply_diff("", op.get("diff") or "", mode="create")
+        elif op["type"] == "update_file":
+            if not target.exists():
+                raise ValueError(f"File not found: {op['path']}")
+            old_content = target.read_text()
+            new_content = self._apply_diff(old_content, op.get("diff") or "")
+        else:
+            raise ValueError(f"Unsupported operation type: {op['type']}")
+
+        if old_content == new_content:
+            return ""
+
+        old_lines = old_content.splitlines()
+        new_lines = new_content.splitlines()
+        to_name = op["path"] if op["type"] != "delete_file" else "(deleted)"
+        diff_lines = difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=op["path"],
+            tofile=to_name,
+            lineterm="",
+        )
+        return "\n".join(diff_lines)
+
+    def _apply_operation(self, operation: dict[str, Any], base_dir: Path) -> tuple[bool, str]:
+        try:
+            op = self._normalize_operation(operation)
+            target = self._resolve_path(base_dir, op["path"])
+            if op["type"] == "delete_file":
+                if not target.exists():
+                    return False, f"File not found: {op['path']}"
+                target.unlink()
+                return True, f"Deleted {op['path']}"
+            if op["type"] == "create_file":
+                if target.exists():
+                    return False, f"File already exists: {op['path']}"
+                content = self._apply_diff("", op.get("diff") or "", mode="create")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+                return True, f"Created {op['path']}"
+            if op["type"] == "update_file":
+                if not target.exists():
+                    return False, f"File not found: {op['path']}"
+                old_content = target.read_text()
+                new_content = self._apply_diff(old_content, op.get("diff") or "")
+                if new_content != old_content:
+                    target.write_text(new_content)
+                return True, f"Updated {op['path']}"
+            return False, f"Unsupported operation type: {op['type']}"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _read_local_file(self, path: str, base_dir: Path) -> str:
+        resolved = self._resolve_path(base_dir, path)
+        return resolved.read_text()
 
     def _process_tool_calls(
         self,
@@ -289,6 +588,12 @@ class ChatScreen(Screen):
         )
         self._render_entries()
 
+    def _append_assistant_renderable(self, renderable: Any, tool_calls: list[dict[str, Any]]) -> None:
+        self._entries.append(
+            {"role": "assistant", "renderables": [renderable], "tool_calls": tool_calls}
+        )
+        self._render_entries()
+
     def _append_system_message(self, message: str) -> None:
         self._entries.append({"role": "system", "content": f"[bold red]{message}[/bold red]"})
         self._render_entries()
@@ -398,8 +703,13 @@ class ChatScreen(Screen):
                 continue
             if role == "assistant":
                 log.write("")
-                for line in self._format_lines(content):
-                    log.write(line)
+                renderables = entry.get("renderables")
+                if renderables:
+                    for renderable in renderables:
+                        log.write(renderable)
+                else:
+                    for line in self._format_lines(content):
+                        log.write(line)
                 tool_calls = entry.get("tool_calls") or []
                 if tool_calls:
                     tool_list = ", ".join(call.get("name", "tool") for call in tool_calls)
