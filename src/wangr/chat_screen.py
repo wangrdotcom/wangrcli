@@ -14,7 +14,7 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Input, RichLog, Static
+from textual.widgets import Footer, Header, Input, RichLog
 from textual.worker import Worker
 
 from wangr.config import API_TIMEOUT, CHAT_API_URL
@@ -49,13 +49,13 @@ class ChatScreen(Screen):
         self._tool_executor = LocalToolExecutor(working_directory=str(Path.cwd()))
         self._pending_file_ops: dict[str, Any] | None = None
         self._auto_approve_chain = False
+        self._pending_requires_approval = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
         yield Container(
             RichLog(id="chat-log", wrap=True, highlight=True, markup=True),
-            Static("", id="chat-status"),
             Input(placeholder="Ask Wangr…", id="chat-input"),
             id="chat-container",
         )
@@ -88,10 +88,9 @@ class ChatScreen(Screen):
             return
         if self._worker and self._worker.is_running:
             return
-        if self._pending_file_ops:
+        if self._pending_file_ops and self._pending_requires_approval:
             normalized = message.lower()
             if normalized not in {"y", "n"}:
-                self._show_status_temp("Please enter 'y' or 'n'.")
                 return
             decision = normalized == "y"
             event.input.value = ""
@@ -121,10 +120,6 @@ class ChatScreen(Screen):
         if event.state.name == "SUCCESS":
             self._stop_processing()
             response, tool_calls = event.worker.result
-            if tool_calls:
-                self._show_status_temp(f"Tool calls: {len(tool_calls)}")
-            else:
-                self._show_status_temp("No tool calls")
             self._append_assistant_message(response, tool_calls)
             if self._pending_file_ops:
                 input_box.disabled = True
@@ -136,7 +131,6 @@ class ChatScreen(Screen):
             input_box.disabled = False
             input_box.focus()
             self._stop_processing()
-            self._show_status_temp("Request failed. Try again.")
             self._append_system_message("Request failed.")
 
     def _chat_request(self, message: str) -> tuple[str, list[dict[str, Any]]]:
@@ -154,7 +148,13 @@ class ChatScreen(Screen):
                 self._pending_file_ops = pending
                 self._auto_approve_chain = False
                 prompt = self._prepare_pending_prompt(pending)
-                return prompt, []
+                if self._pending_requires_approval:
+                    return prompt, []
+                reply, _ = self._resolve_pending_request(True)
+                self._history.append({"role": "user", "content": message})
+                self._history.append({"role": "assistant", "content": reply})
+                self._persist_state()
+                return reply, []
             if tool_calls:
                 tool_names = [
                     call.get("name") or call.get("type", "tool")
@@ -203,6 +203,21 @@ class ChatScreen(Screen):
         pending = self._pending_file_ops
         if not pending:
             return "No pending operations.", []
+        if approved and self._auto_approve_chain:
+            response = ""
+            remaining = pending
+            for _ in range(20):
+                response, next_pending, _auto_approved = self._resolve_pending(
+                    remaining, True, True
+                )
+                if not next_pending:
+                    remaining = None
+                    break
+                remaining = next_pending
+            self._pending_file_ops = remaining
+            self._auto_approve_chain = True
+            self._pending_requires_approval = False
+            return response, []
         response, next_pending, auto_approved = self._resolve_pending(
             pending, approved, self._auto_approve_chain
         )
@@ -211,21 +226,47 @@ class ChatScreen(Screen):
         if self._pending_file_ops:
             prompt = self._prepare_pending_prompt(self._pending_file_ops)
             return prompt, []
+        self._pending_requires_approval = False
         return response, []
 
     def _prepare_pending_prompt(self, pending: dict[str, Any]) -> str:
         preview, approvable, _auto_outputs = self._categorize_patch_ops(pending)
+        self._pending_requires_approval = bool(approvable)
         if preview:
-            renderable = Group(Text("Proposed changes:", style="bold"), Syntax(preview, "diff"))
+            renderable = Group(
+                Text("Proposed changes:", style="bold"),
+                self._render_diff(preview),
+            )
             self._append_assistant_renderable(renderable, [])
         elif approvable:
             self._append_assistant_message("[dim]Proposed changes (no diff preview available).[/dim]", [])
         if approvable:
-            return "Apply these changes? Press Y/N."
-        return "No approvable changes."
+            return "Apply these changes? [bold]Y[/bold]/[bold]N[/bold]"
+        return ""
+
+    def _render_diff(self, preview: str) -> Group:
+        """Render a diff without background, using theme-matching colors."""
+        lines = preview.splitlines()
+        width = len(str(len(lines))) if lines else 1
+        rendered = []
+        for idx, line in enumerate(lines, start=1):
+            text = Text()
+            text.append(f"{idx:>{width}} ", style="dim")
+            if line.startswith("+++") or line.startswith("---"):
+                text.append(line, style="dim")
+            elif line.startswith("@@"):
+                text.append(line, style="cyan")
+            elif line.startswith("+"):
+                text.append(line, style="green")
+            elif line.startswith("-"):
+                text.append(line, style="red")
+            else:
+                text.append(line, style="white")
+            rendered.append(text)
+        return Group(*rendered)
 
     def on_key(self, event: events.Key) -> None:
-        if not self._pending_file_ops:
+        if not self._pending_file_ops or not self._pending_requires_approval:
             return
         if self._worker and self._worker.is_running:
             return
@@ -317,8 +358,7 @@ class ChatScreen(Screen):
                 diff = self._preview_operation(operation, base_dir)
                 if diff:
                     previews.append(diff)
-                    approvable.append(op)
-                elif op_type in {"create_file", "delete_file"}:
+                if op_type in {"create_file", "update_file", "delete_file"}:
                     approvable.append(op)
             except Exception as exc:
                 path = operation.get("path", "<unknown>")
@@ -604,11 +644,11 @@ class ChatScreen(Screen):
         formatted: list[str] = []
         for line in lines:
             if line.startswith("- "):
-                formatted.append(self._wrap_line(f"  - {line[2:]}", background))
+                formatted.append(self._wrap_line(f"- {line[2:]}", background))
             elif line.strip() == "":
                 formatted.append(self._wrap_line("", background))
             else:
-                formatted.append(self._wrap_line(f"  {line}", background))
+                formatted.append(self._wrap_line(f"{line}", background))
         return formatted
 
     def _wrap_line(
@@ -651,7 +691,7 @@ class ChatScreen(Screen):
             self._processing_timer.stop()
             self._processing_timer = None
         self._remove_processing_placeholder()
-        self.query_one("#chat-status", Static).update("")
+        return
 
     def _tick_processing(self) -> None:
         self._processing_frame = (self._processing_frame + 1) % 4
@@ -667,10 +707,7 @@ class ChatScreen(Screen):
         log = self.query_one("#chat-log", RichLog)
         return log.size.width or log.min_width
 
-    def _show_status_temp(self, message: str, seconds: float = 2.0) -> None:
-        status = self.query_one("#chat-status", Static)
-        status.update(message)
-        self.set_timer(seconds, lambda: status.update(""))
+    # status display removed
 
     def _append_processing_placeholder(self) -> None:
         """Append a placeholder assistant response with animation."""
@@ -713,7 +750,6 @@ class ChatScreen(Screen):
                 tool_calls = entry.get("tool_calls") or []
                 if tool_calls:
                     tool_list = ", ".join(call.get("name", "tool") for call in tool_calls)
-                    log.write(f"[dim]Tools used: {tool_list}[/dim]")
                 log.write("")
                 log.write("")
                 continue
@@ -731,6 +767,6 @@ class ChatScreen(Screen):
         log.write(self._wrap_line("", background=bg))
         lines = message.splitlines() if message else [""]
         for idx, line in enumerate(lines):
-            prefix = "  > " if idx == 0 else "    "
+            prefix = "> " if idx == 0 else ""
             log.write(self._wrap_line(f"{prefix}{line}", background=bg))
         log.write(self._wrap_line("", background=bg))

@@ -494,26 +494,34 @@ SortModal {
 /* Chat Screen */
 #chat-container {
     height: 100%;
-    padding: 1 2;
+    width: 100%;
+    padding: 0;
 }
 
 #chat-log {
     height: 1fr;
-    border: solid $primary;
-    padding: 1 2;
-    margin: 1 0;
+    width: 100%;
+    border: none;
+    padding: 0;
+    margin: 0;
+    overflow-x: hidden;
+    overflow-y: hidden;
+    scrollbar-size: 0 0;
 }
 
 #chat-input {
     height: 3;
+    width: 100%;
     border: solid $panel;
     padding: 0 1;
+    margin: 0;
 }
 
 #chat-status {
     height: 1;
     color: $accent;
-    margin: 0 0 1 0;
+    margin: 0;
+    display: none;
 }
 
 /* Loading Spinner Widget */
