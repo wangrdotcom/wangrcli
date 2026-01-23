@@ -393,7 +393,7 @@ class WhalesFullScreen(Screen):
 
     def _update_summary_display(self) -> None:
         """Update the summary stats display."""
-        w = self._get_current_summary()
+        w = self._get_current_summary() or {}
         coin_symbols = {"BTC": "₿", "ETH": "Ξ", "SOL": "◎"}
         coin_sym = coin_symbols.get(self.selected_coin, "")
 

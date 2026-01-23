@@ -262,10 +262,11 @@ class DashboardScreen(DataFetchingScreen):
         ])
 
     def _whales_summary(self) -> str:
-        def line(symbol: str, data: dict) -> str:
-            count = data.get('count', 0)
-            longs = data.get('long_count', 0)
-            shorts = data.get('short_count', 0)
+        def line(symbol: str, data: dict | None) -> str:
+            data = data or {}
+            count = data.get("count", 0)
+            longs = data.get("long_count", 0)
+            shorts = data.get("short_count", 0)
             total = max(longs + shorts, 1)
             bar = mini_bar(longs, total, width=12)
             return f"{symbol} {count:>3}  {bar}  {longs:>2}L {shorts:>2}S"
