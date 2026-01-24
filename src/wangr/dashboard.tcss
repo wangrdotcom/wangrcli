@@ -259,6 +259,41 @@ WhalesScreen #whale-content {
     align: center middle;
 }
 
+/* Polymarket Full Screen */
+#polyfull-coins {
+    height: auto;
+    margin: 1 2 0 2;
+    align: center middle;
+}
+
+#polyfull-window {
+    height: auto;
+    margin: 0 2 1 2;
+    align: center middle;
+}
+
+.window-toggle {
+    width: 9;
+    margin: 0 1;
+    padding: 0 2;
+    border: solid $panel;
+    color: $text;
+    content-align: center middle;
+    transition: border 200ms, color 200ms, background 200ms;
+}
+
+.window-toggle:hover {
+    border: solid $accent;
+    color: $accent;
+}
+
+.window-toggle-active {
+    border: solid $primary;
+    color: $primary;
+    text-style: bold;
+    background: $primary 15%;
+}
+
 #whale-summary {
     border: solid $primary;
     padding: 1 2;
@@ -321,6 +356,220 @@ WhalesScreen #whale-content {
 #whales-table {
     height: 1fr;
     margin: 0 2;
+}
+
+#polyfull-summary {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 0 2 1 2;
+    height: auto;
+}
+
+#polyfull-columns {
+    height: auto;
+}
+
+#polyfull-left-col {
+    width: 1fr;
+    height: auto;
+}
+
+#polyfull-right-col {
+    width: 1fr;
+    height: auto;
+    margin-left: 2;
+}
+
+.polyfull-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.polyfull-section-header {
+    text-style: bold;
+    color: $accent;
+    margin: 1 0 0 0;
+}
+
+.polyfull-metric {
+    margin: 0;
+}
+
+.polyfull-status {
+    color: $warning;
+    margin: 1 0 0 0;
+}
+
+#polyfull-pivots {
+    height: 10;
+    margin: 0 2 1 2;
+}
+
+#polyfull-mispricings {
+    height: 1fr;
+    margin: 0 2 1 2;
+}
+
+#polyfull-strikes {
+    height: 16;
+    margin: 0 2 1 2;
+}
+
+#polyfull-updown {
+    height: 10;
+    margin: 0 2;
+}
+
+/* Polymarket Whales Screen */
+#polywhale-wrapper {
+    width: 100%;
+    height: 100%;
+    align: center top;
+}
+
+#polywhale-summary {
+    border: solid $primary;
+    padding: 1 2;
+    margin: 0 2 1 2;
+    height: auto;
+    width: 100%;
+    background: $surface-darken-1;
+}
+
+.polywhale-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+}
+
+.polywhale-sep {
+    color: $panel;
+    margin: 0 1;
+}
+
+.polywhale-status {
+    color: $warning;
+    margin: 1 0 0 0;
+}
+
+.polywhale-summary {
+    color: $text-muted;
+    margin: 0 0 0 0;
+}
+
+.polywhale-summary-strong {
+    color: $text;
+    text-style: bold;
+    margin: 0 0 1 0;
+}
+
+.polywhale-bar {
+    color: $success;
+    margin: 0 0 0 0;
+}
+
+.polywhale-list {
+    color: $text;
+    margin: 0 0 1 0;
+}
+
+#polywhale-summary-columns {
+    height: auto;
+    margin: 1 0 0 0;
+}
+
+#polywhale-summary-left {
+    width: 1fr;
+    margin-right: 2;
+}
+
+#polywhale-summary-right {
+    width: 1fr;
+}
+
+#polywhale-table {
+    height: 1fr;
+    margin: 0 2 1 2;
+    width: 100%;
+}
+
+#polywhale-details {
+    height: auto;
+    width: 100%;
+}
+
+.polywhale-details-card {
+    border: solid $panel;
+    padding: 1 2;
+    margin: 0 2 1 2;
+    background: $surface-darken-1;
+}
+
+.polywhale-details-title {
+    text-style: bold;
+    color: $accent;
+    margin: 0 0 1 0;
+}
+
+.polywhale-stat-block {
+    margin: 0 0 1 0;
+    color: $text;
+}
+
+#polywhale-stat-grid {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#polywhale-stat-win,
+#polywhale-stat-open,
+#polywhale-stat-closed,
+#polywhale-stat-volume {
+    width: 1fr;
+    height: auto;
+    margin-right: 2;
+}
+
+.polywhale-stat-label {
+    color: $text-muted;
+}
+
+.polywhale-stat-value {
+    color: $text;
+    text-style: bold;
+}
+
+.polywhale-stat-sub {
+    color: $text-muted;
+}
+
+.polywhale-section-header {
+    text-style: bold;
+    color: $accent;
+    margin: 1 0 0 0;
+}
+
+#polywhale-open {
+    height: 8;
+    margin: 0 0 1 0;
+}
+
+#polywhale-closed {
+    height: 8;
+    margin: 0 0 1 0;
+}
+
+#polywhale-positions {
+    height: 12;
+    margin: 0;
+}
+
+.polywhale-open-table,
+.polywhale-closed-table,
+.polywhale-positions-table {
+    border: solid $panel;
+    background: $surface-darken-2;
 }
 
 /* WOI Full Screen */

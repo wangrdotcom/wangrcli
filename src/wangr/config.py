@@ -4,11 +4,14 @@ from typing import Final
 
 # API URLs
 FRONTPAGE_API_URL: Final[str] = "https://polymarket-api.wangr.com/frontpage/"
+PMARKETS_BASE_URL: Final[str] = "https://pmarkets.wangr.com"
 BTC_WHALES_API_URL: Final[str] = "https://api3.wangr.com/whales"
 ETH_WHALES_API_URL: Final[str] = "https://ethwhalesapi.wangr.com/whales"
 SOL_WHALES_API_URL: Final[str] = "https://solwhalesapi.wangr.com/whales"
 CHAT_API_URL: Final[str] = "https://cliagent.wangr.com/chat"
 WOI_TRACKED_USERS_API_URL: Final[str] = "https://api2899.wangr.com/woi/tracked-users?limit=400"
+POLYMARKET_WHALES_API_URL: Final[str] = "https://polymarket-api.wangr.com/whales"
+POLYMARKET_TRADER_API_URL: Final[str] = "https://polymarket-api.wangr.com/trader"
 
 # Timeouts
 API_TIMEOUT: Final[int] = 10

@@ -11,7 +11,7 @@ from wangr.chat_screen import ChatScreen
 from wangr.config import MILLION
 from wangr.liquidations import LiquidationsScreen
 from wangr.market_brief import MarketBriefScreen
-from wangr.polymarket import PolymarketScreen
+from wangr.polymarket_whales import PolymarketWhalesScreen
 from wangr.sparkline import mini_bar
 from wangr.utils import safe_division, safe_float
 from wangr.whales_full import WhalesFullScreen
@@ -56,8 +56,6 @@ class DashboardScreen(DataFetchingScreen):
         ("up,k", "focus_up", "Focus Up"),
         ("down,j", "focus_down", "Focus Down"),
         ("enter", "open_focused", "Open Focused"),
-        ("w", "open_whales_full", "Whales Full"),
-        ("o", "open_woi_full", "WOI Full"),
     ]
 
     CARD_DEFS = [
@@ -65,7 +63,7 @@ class DashboardScreen(DataFetchingScreen):
         ("whales", "🐋 Whales", WhalesFullScreen),
         ("woi", "🔍 Wallets of Interest", WOIFullScreen),
         ("liquidations", "💧 Liquidations", LiquidationsScreen),
-        ("polymarket", "📈 Polymarket", PolymarketScreen),
+        ("polymarket", "📈 Polymarket", PolymarketWhalesScreen),
         ("arbitrage", "⚖️ Arbitrage", ArbitrageScreen),
         ("chat", "💬 Chat", ChatScreen),
     ]
