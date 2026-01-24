@@ -862,3 +862,63 @@ Button:focus {
     background: $primary;
     text-style: bold;
 }
+
+/* Settings Screen */
+#settings-container {
+    width: 100%;
+    height: 100%;
+    align: center middle;
+}
+
+.settings-form {
+    width: 60;
+    height: auto;
+    border: solid $primary;
+    padding: 2 3;
+    background: $surface-darken-1;
+}
+
+.settings-title {
+    text-style: bold;
+    color: $primary;
+    text-align: center;
+    width: 100%;
+    margin: 0 0 1 0;
+}
+
+.settings-spacer {
+    height: 1;
+}
+
+.settings-label {
+    text-style: bold;
+    color: $accent;
+    margin: 1 0 0 0;
+}
+
+.settings-description {
+    color: $text-muted;
+    margin: 0 0 1 0;
+}
+
+.settings-input {
+    width: 100%;
+    margin: 0 0 1 0;
+}
+
+.settings-status {
+    height: 2;
+    margin: 0 0 1 0;
+    text-align: center;
+}
+
+.settings-buttons {
+    layout: horizontal;
+    height: auto;
+    align: center middle;
+    margin: 1 0 0 0;
+}
+
+.settings-buttons Button {
+    margin: 0 1;
+}

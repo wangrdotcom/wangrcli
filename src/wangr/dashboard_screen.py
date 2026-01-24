@@ -12,6 +12,8 @@ from wangr.config import MILLION
 from wangr.liquidations import LiquidationsScreen
 from wangr.market_brief import MarketBriefScreen
 from wangr.polymarket_whales import PolymarketWhalesScreen
+from wangr.settings import get_api_key, is_api_key_configured
+from wangr.settings_screen import SettingsScreen
 from wangr.sparkline import mini_bar
 from wangr.utils import safe_division, safe_float
 from wangr.whales_full import WhalesFullScreen
@@ -56,6 +58,7 @@ class DashboardScreen(DataFetchingScreen):
         ("up,k", "focus_up", "Focus Up"),
         ("down,j", "focus_down", "Focus Down"),
         ("enter", "open_focused", "Open Focused"),
+        ("s", "open_settings", "Settings"),
     ]
 
     CARD_DEFS = [
@@ -149,7 +152,7 @@ class DashboardScreen(DataFetchingScreen):
         self._cards["liquidations"].set_body(self._liquidations_summary())
         self._cards["polymarket"].set_body(self._polymarket_summary())
         self._cards["arbitrage"].set_body(self._arbitrage_summary())
-        self._cards["chat"].set_body("AI-powered market analysis\n[dim]Ask about whales, WOI, prices...[/dim]")
+        self._cards["chat"].set_body(self._chat_summary())
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Open the screen associated with a card."""
@@ -164,7 +167,7 @@ class DashboardScreen(DataFetchingScreen):
         for card_key, _title, screen_cls in self.CARD_DEFS:
             if key == card_key:
                 if card_key == "chat":
-                    self.app.push_screen(ChatScreen())
+                    self._open_chat_with_key_check()
                 elif card_key == "whales":
                     cache = getattr(self.app, "whales_full_cache", None)
                     self.app.push_screen(WhalesFullScreen(self.data, cache=cache))
@@ -178,6 +181,26 @@ class DashboardScreen(DataFetchingScreen):
                     else:
                         self.app.push_screen(screen_cls(self.data))
                 break
+
+    def _open_chat_with_key_check(self) -> None:
+        """Open chat screen if API key is configured, otherwise show settings."""
+        if is_api_key_configured():
+            self.app.push_screen(ChatScreen())
+        else:
+            # Open settings with callback to open chat after key is validated
+            self.app.push_screen(
+                SettingsScreen(on_key_validated=self._on_api_key_validated)
+            )
+
+    def _on_api_key_validated(self) -> None:
+        """Callback after API key is validated in settings."""
+        # Pop the settings screen and open chat
+        self.app.pop_screen()
+        self.app.push_screen(ChatScreen())
+
+    def action_open_settings(self) -> None:
+        """Open the settings screen."""
+        self.app.push_screen(SettingsScreen())
 
     def action_open_whales_full(self) -> None:
         """Open the full whales table."""
@@ -327,6 +350,11 @@ class DashboardScreen(DataFetchingScreen):
             f"PnL      [{pnl_color}]${total_pnl:>6.2f}M[/{pnl_color}]",
             f"Volume   ${total_vol:>6.2f}M",
         ])
+
+    def _chat_summary(self) -> str:
+        if is_api_key_configured():
+            return "AI-powered market analysis\n[dim]Ask about whales, WOI, prices...[/dim]"
+        return "[yellow]API key required[/yellow]\n[dim]Press S for Settings[/dim]"
 
     def _arbitrage_summary(self) -> str:
         spot = self.data.get("arbitrage", {}).get("spot", {})

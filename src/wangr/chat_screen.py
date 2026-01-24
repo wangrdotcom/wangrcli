@@ -18,6 +18,7 @@ from textual.widgets import Footer, Header, Input, RichLog
 from textual.worker import Worker
 
 from wangr.config import API_TIMEOUT, CHAT_API_URL
+from wangr.settings import get_api_key
 from wangr.tools import LocalToolExecutor
 
 logger = logging.getLogger(__name__)
@@ -180,9 +181,14 @@ class ChatScreen(Screen):
             raise RuntimeError("chat request failed") from exc
 
     def _post_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        headers = {}
+        api_key = get_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         response = requests.post(
             CHAT_API_URL,
             json=payload,
+            headers=headers,
             timeout=API_TIMEOUT * 12,
         )
         response.raise_for_status()
@@ -190,9 +196,14 @@ class ChatScreen(Screen):
         return response.json()
 
     def _post_chat_continue(self, payload: dict[str, Any]) -> dict[str, Any]:
+        headers = {}
+        api_key = get_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         response = requests.post(
             f"{CHAT_API_URL}/continue",
             json=payload,
+            headers=headers,
             timeout=API_TIMEOUT * 12,
         )
         response.raise_for_status()
