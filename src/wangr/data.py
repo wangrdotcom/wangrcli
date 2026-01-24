@@ -7,6 +7,7 @@ import requests
 
 from wangr.config import (
     API_TIMEOUT,
+    ARBITRAGE_API_URL,
     BTC_WHALES_API_URL,
     ETH_WHALES_API_URL,
     FRONTPAGE_API_URL,
@@ -78,6 +79,65 @@ def fetch_woi_full_data() -> dict:
     except requests.RequestException as e:
         logger.error(f"Error fetching WOI full data from {WOI_TRACKED_USERS_API_URL}: {e}")
         return {"users": []}
+
+
+def fetch_arbitrage_data(market: str = "futures") -> dict:
+    """
+    Fetch arbitrage opportunities and health for a given market.
+
+    Args:
+        market: "futures" or "spot"
+
+    Returns:
+        Dictionary with opportunities, health, and market.
+    """
+    prefix = "/futures" if market == "futures" else ""
+    try:
+        health_resp = requests.get(f"{ARBITRAGE_API_URL}{prefix}/health", timeout=API_TIMEOUT)
+        top_resp = requests.get(
+            f"{ARBITRAGE_API_URL}{prefix}/arbitrage/top",
+            params={"limit": 50, "min_net_pct": -999},
+            timeout=API_TIMEOUT,
+        )
+        if not health_resp.ok or not top_resp.ok:
+            return {"market": market, "opportunities": [], "health": None}
+        return {
+            "market": market,
+            "opportunities": top_resp.json(),
+            "health": health_resp.json(),
+        }
+    except requests.RequestException as e:
+        logger.error(f"Error fetching arbitrage data from {ARBITRAGE_API_URL}: {e}")
+        return {"market": market, "opportunities": [], "health": None}
+
+
+def fetch_arbitrage_dex_data() -> dict:
+    """
+    Fetch DEX arbitrage data.
+
+    Returns:
+        Dictionary with base_token, amount_in_wei, pairs, and missing_pairs.
+    """
+    try:
+        resp = requests.get(f"{ARBITRAGE_API_URL}/dex/arbitrage", timeout=API_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "market": "dex",
+            "base_token": data.get("base_token"),
+            "amount_in_wei": data.get("amount_in_wei"),
+            "pairs": data.get("pairs", []) or [],
+            "missing_pairs": data.get("missing_pairs", []) or [],
+        }
+    except requests.RequestException as e:
+        logger.error(f"Error fetching DEX arbitrage data from {ARBITRAGE_API_URL}: {e}")
+        return {"market": "dex", "pairs": [], "missing_pairs": []}
+    except ValueError as e:
+        logger.error(f"Error parsing DEX JSON from {ARBITRAGE_API_URL}: {e}")
+        return {"market": "dex", "pairs": [], "missing_pairs": []}
+    except ValueError as e:
+        logger.error(f"Error parsing JSON from {ARBITRAGE_API_URL}: {e}")
+        return {"market": market, "opportunities": [], "health": None}
     except ValueError as e:
         logger.error(f"Error parsing JSON from {WOI_TRACKED_USERS_API_URL}: {e}")
         return {"users": []}

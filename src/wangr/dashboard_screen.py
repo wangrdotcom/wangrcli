@@ -172,7 +172,11 @@ class DashboardScreen(DataFetchingScreen):
                     cache = getattr(self.app, "woi_full_cache", None)
                     self.app.push_screen(WOIFullScreen(self.data, cache=cache))
                 else:
-                    self.app.push_screen(screen_cls(self.data))
+                    if card_key == "arbitrage":
+                        cache = getattr(self.app, "arb_cache", None)
+                        self.app.push_screen(screen_cls(self.data, cache=cache))
+                    else:
+                        self.app.push_screen(screen_cls(self.data))
                 break
 
     def action_open_whales_full(self) -> None:

@@ -1,93 +1,555 @@
-"""Arbitrage screen."""
+"""Arbitrage screen with live opportunities table."""
 
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+import requests
+from textual import events
 from textual.app import ComposeResult
-from textual.containers import Container
-from textual.widgets import Footer, Header, Label
+from textual.containers import Container, Horizontal
+from textual.reactive import reactive
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, Label, Static
+from textual.worker import Worker
 
-from wangr.base_screen import DataFetchingScreen
+from wangr.config import API_TIMEOUT, ARBITRAGE_API_URL, FETCH_INTERVAL
+from wangr.sort_modal import SortModal
+from wangr.utils import safe_float
+
+logger = logging.getLogger(__name__)
 
 
-class ArbitrageScreen(DataFetchingScreen):
+class ArbitrageScreen(Screen):
     """Screen displaying arbitrage opportunities."""
 
-    BINDINGS = [("b", "go_back", "Go Back")]
+    BINDINGS = [
+        ("b", "go_back", "Go Back"),
+        ("j", "cursor_down", "Down"),
+        ("k", "cursor_up", "Up"),
+        ("down", "cursor_down", "Down"),
+        ("up", "cursor_up", "Up"),
+        ("left,h", "prev_market", "Prev Market"),
+        ("right,l", "next_market", "Next Market"),
+        ("ctrl+d", "page_down", "Page Down"),
+        ("ctrl+u", "page_up", "Page Up"),
+        ("G", "cursor_bottom", "Bottom"),
+        ("s", "sort_by_column", "Sort Column"),
+        ("S", "toggle_sort_direction", "Toggle Sort"),
+        ("f", "toggle_market", "Toggle Market"),
+    ]
 
-    def __init__(self, data: dict) -> None:
-        """Initialize arbitrage screen with data."""
-        super().__init__(data)
-        self.arb = data.get("arbitrage", {})
+    MARKET_TYPES = ["futures", "spot", "dex"]
+
+    COLUMN_DEFS_BASE = [
+        ("symbol", "Symbol"),
+        ("buy_exchange", "Buy"),
+        ("sell_exchange", "Sell"),
+        ("gross_spread_pct", "Gross"),
+        ("net_spread_pct", "Net"),
+    ]
+
+    COLUMN_DEFS_FUTURES = [
+        ("funding_rate_diff", "Funding Δ"),
+        ("net_after_funding_pct", "Net + Fund"),
+    ]
+
+    COLUMN_DEFS_TAIL = [
+        ("buy_price", "Buy Price"),
+        ("sell_price", "Sell Price"),
+        ("status", "Status"),
+    ]
+
+    market_type: reactive[str] = reactive("futures")
+
+    def __init__(self, data: dict | None = None, cache: dict | None = None) -> None:
+        super().__init__()
+        self.data = data or {}
+        self.cache = cache or {}
+        self.opportunities: list[dict] = []
+        self.health: dict | None = None
+        self.error_message = ""
+
+        self.sort_column: str | None = "net_spread_pct"
+        self.sort_reverse: bool = True
+
+        self.update_timer = None
+        self._arb_worker: Optional[Worker] = None
+        self._fetch_token = 0
+        self._pending_g = False
+        self._g_timer = None
+
+        cached = self.cache.get(self.market_type)
+        if isinstance(cached, dict):
+            if self.market_type == "dex" and not cached.get("opportunities") and cached.get("pairs"):
+                self.opportunities = self._normalize_dex_pairs(
+                    cached.get("pairs", []) or [],
+                    cached.get("base_token"),
+                )
+                self.health = None
+            else:
+                self.opportunities = cached.get("opportunities", []) or []
+                self.health = cached.get("health")
 
     def compose(self) -> ComposeResult:
-        """Compose the screen UI."""
         yield Header()
         yield Footer()
-        yield Container(id="arb-main")
+        yield Container(
+            Container(
+                Horizontal(
+                    Static("FUTURES", id="arb-market-futures", classes="coin-toggle coin-toggle-active"),
+                    Static("SPOT", id="arb-market-spot", classes="coin-toggle"),
+                    Static("DEX", id="arb-market-dex", classes="coin-toggle"),
+                    id="arb-toggle-row",
+                ),
+                Label("Arbitrage", id="arb-title", classes="arb-title"),
+                Label("", id="arb-line-1", classes="arb-summary"),
+                Label("", id="arb-line-2", classes="arb-summary"),
+                Label("", id="arb-line-3", classes="arb-summary"),
+                Label("", id="arb-status", classes="arb-status"),
+                id="arb-summary",
+            ),
+            DataTable(id="arb-table", zebra_stripes=True, cursor_type="row"),
+            id="arb-wrapper",
+        )
 
-    def _process_new_data(self, new_data: dict) -> None:
-        """Process new data from API."""
-        super()._process_new_data(new_data)
-        self.arb = new_data.get("arbitrage", {})
+    async def on_mount(self) -> None:
+        for selector in ("#arb-market-futures", "#arb-market-spot", "#arb-market-dex"):
+            try:
+                self.query_one(selector).can_focus = False
+            except Exception:
+                pass
+        self._update_display()
+        self.query_one("#arb-table", DataTable).focus()
+        self._fetch_data()
+        self.update_timer = self.set_interval(FETCH_INTERVAL, self._fetch_data)
+
+    def on_unmount(self) -> None:
+        if self.update_timer:
+            self.update_timer.stop()
+            self.update_timer = None
+        if self._arb_worker and self._arb_worker.is_running:
+            self._arb_worker.cancel()
+        if self._g_timer:
+            self._g_timer.stop()
+            self._g_timer = None
+
+    def on_click(self, event: events.Click) -> None:
+        target = event.widget
+        if not isinstance(target, Static):
+            return
+        if target.id == "arb-market-futures":
+            self.market_type = "futures"
+        elif target.id == "arb-market-spot":
+            self.market_type = "spot"
+        elif target.id == "arb-market-dex":
+            self.market_type = "dex"
+
+    def watch_market_type(self, _old: str, _new: str) -> None:
+        if not self.is_mounted:
+            return
+        self._update_toggle_classes()
+        # Clear current data to avoid showing stale rows during switch
+        self.opportunities = []
+        self.health = None
+        self.error_message = ""
+        cached = self.cache.get(self.market_type)
+        if isinstance(cached, dict):
+            if self.market_type == "dex" and not cached.get("opportunities") and cached.get("pairs"):
+                self.opportunities = self._normalize_dex_pairs(
+                    cached.get("pairs", []) or [],
+                    cached.get("base_token"),
+                )
+                self.health = None
+            else:
+                self.opportunities = cached.get("opportunities", []) or []
+                self.health = cached.get("health")
+            self._update_display()
+        else:
+            self._update_display()
+        self._fetch_data()
+
+
+    def action_toggle_market(self) -> None:
+        idx = (self.MARKET_TYPES.index(self.market_type) + 1) % len(self.MARKET_TYPES)
+        self.market_type = self.MARKET_TYPES[idx]
+
+    def action_prev_market(self) -> None:
+        idx = (self.MARKET_TYPES.index(self.market_type) - 1) % len(self.MARKET_TYPES)
+        self.market_type = self.MARKET_TYPES[idx]
+
+    def action_next_market(self) -> None:
+        idx = (self.MARKET_TYPES.index(self.market_type) + 1) % len(self.MARKET_TYPES)
+        self.market_type = self.MARKET_TYPES[idx]
+
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#arb-table", DataTable).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#arb-table", DataTable).action_cursor_up()
+
+    def action_page_down(self) -> None:
+        self.query_one("#arb-table", DataTable).action_page_down()
+
+    def action_page_up(self) -> None:
+        self.query_one("#arb-table", DataTable).action_page_up()
+
+    def action_cursor_top(self) -> None:
+        table = self.query_one("#arb-table", DataTable)
+        if table.row_count > 0:
+            table.move_cursor(row=0)
+
+    def action_cursor_bottom(self) -> None:
+        table = self.query_one("#arb-table", DataTable)
+        if table.row_count > 0:
+            table.move_cursor(row=table.row_count - 1)
+
+    def action_sort_by_column(self) -> None:
+        self.app.push_screen(
+            SortModal(self._column_defs(), self.sort_column, self.sort_reverse),
+            self._on_sort_selected,
+        )
+
+    def action_toggle_sort_direction(self) -> None:
+        if self.sort_column is None:
+            self.sort_column = self._column_defs()[0][0]
+        self.sort_reverse = not self.sort_reverse
+        self._update_table()
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "g":
+            event.prevent_default()
+            if self._pending_g:
+                self._pending_g = False
+                if self._g_timer:
+                    self._g_timer.stop()
+                    self._g_timer = None
+                self.action_cursor_top()
+            else:
+                self._pending_g = True
+                if self._g_timer:
+                    self._g_timer.stop()
+                self._g_timer = self.set_timer(0.5, self._clear_pending_g)
+        else:
+            self._clear_pending_g()
+
+    def _clear_pending_g(self) -> None:
+        self._pending_g = False
+        if self._g_timer:
+            self._g_timer.stop()
+            self._g_timer = None
+
+    def _column_defs(self) -> list[tuple[str, str]]:
+        cols = list(self.COLUMN_DEFS_BASE)
+        if self.market_type == "futures":
+            cols += self.COLUMN_DEFS_FUTURES
+            cols += self.COLUMN_DEFS_TAIL
+            return cols
+        if self.market_type == "dex":
+            return [
+                ("symbol", "Pair"),
+                ("buy_exchange", "Buy"),
+                ("sell_exchange", "Sell"),
+                ("gross_spread_pct", "Spread %"),
+                ("net_spread_pct", "Net %"),
+                ("spread_value", "Δ (USD)"),
+                ("buy_price", "Buy Price"),
+                ("sell_price", "Sell Price"),
+                ("status", "Status"),
+            ]
+        cols += self.COLUMN_DEFS_TAIL
+        return cols
+
+    def _fetch_data(self) -> None:
+        if self._arb_worker and self._arb_worker.is_running:
+            # Cancel in-flight request so we don't show stale market data
+            self._arb_worker.cancel()
+        self._fetch_token += 1
+        token = self._fetch_token
+        market = self.market_type
+        self._arb_worker = self.run_worker(
+            lambda: self._fetch_arb_data(market, token),
+            thread=True,
+            name=f"arb_{market}_{token}",
+        )
+
+    def _fetch_arb_data(self, market: str, token: int) -> dict[str, Any]:
+        prefix = "/futures" if market == "futures" else ""
+        try:
+            if market == "dex":
+                dex_resp = requests.get(f"{ARBITRAGE_API_URL}/dex/arbitrage", timeout=API_TIMEOUT)
+                if not dex_resp.ok:
+                    return {
+                        "market": "dex",
+                        "token": token,
+                        "error": "Failed to fetch DEX arbitrage data",
+                        "opportunities": [],
+                        "health": None,
+                    }
+                payload = dex_resp.json()
+                opportunities = self._normalize_dex_pairs(payload.get("pairs", []) or [], payload.get("base_token"))
+                return {
+                    "market": "dex",
+                    "token": token,
+                    "opportunities": opportunities,
+                    "health": None,
+                    "error": None,
+                }
+            health_resp = requests.get(f"{ARBITRAGE_API_URL}{prefix}/health", timeout=API_TIMEOUT)
+            top_resp = requests.get(
+                f"{ARBITRAGE_API_URL}{prefix}/arbitrage/top",
+                params={"limit": 50, "min_net_pct": -999},
+                timeout=API_TIMEOUT,
+            )
+            if not health_resp.ok or not top_resp.ok:
+                return {
+                    "market": market,
+                    "token": token,
+                    "error": "Failed to fetch arbitrage data",
+                    "opportunities": [],
+                    "health": None,
+                }
+            return {
+                "market": market,
+                "token": token,
+                "opportunities": top_resp.json(),
+                "health": health_resp.json(),
+                "error": None,
+            }
+        except requests.RequestException as exc:
+            logger.error("Arbitrage fetch failed: %s", exc)
+            return {"market": market, "token": token, "error": str(exc), "opportunities": [], "health": None}
+        except ValueError as exc:
+            logger.error("Arbitrage parse failed: %s", exc)
+            return {"market": market, "token": token, "error": str(exc), "opportunities": [], "health": None}
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.state.name != "SUCCESS" or event.worker != self._arb_worker:
+            return
+        payload = event.worker.result or {}
+        market = payload.get("market", self.market_type)
+        self.opportunities = payload.get("opportunities", []) or []
+        self.health = payload.get("health")
+        self.error_message = payload.get("error") or ""
+        self.cache[market] = {
+            "opportunities": self.opportunities,
+            "health": self.health,
+        }
+        # Only update UI if this result matches the active market
+        if market == self.market_type:
+            self._update_display()
 
     def _update_display(self) -> None:
-        """Update the display with current data."""
-        spot = self.arb.get("spot", {})
-        futures = self.arb.get("futures", {})
-        dex = self.arb.get("dex", {})
+        self._update_toggle_classes()
+        self._update_summary()
+        self._update_table()
 
-        # Format spot opportunity
-        spot_spread = spot.get('net_spread_pct', 0)
-        spot_icon = "✓" if spot_spread > 0.1 else "•"
-        spot_text = f"{spot_icon} SPOT ARBITRAGE\n"
-        if spot:
-            spot_text += (
-                f"  {spot.get('symbol', 'N/A'):12} "
-                f"Buy: {spot.get('buy_exchange', 'N/A'):10} → "
-                f"Sell: {spot.get('sell_exchange', 'N/A'):10}\n"
-            )
-            spot_text += f"  Net Spread: {spot_spread:>6.2f}%"
+    def _update_toggle_classes(self) -> None:
+        mapping = {
+            "futures": "#arb-market-futures",
+            "spot": "#arb-market-spot",
+            "dex": "#arb-market-dex",
+        }
+        for key, selector in mapping.items():
+            label = self.query_one(selector, Static)
+            if key == self.market_type:
+                label.add_class("coin-toggle-active")
+            else:
+                label.remove_class("coin-toggle-active")
+
+    def _update_summary(self) -> None:
+        rows = self.opportunities
+        total = len(rows)
+        positive = len([r for r in rows if safe_float(r.get("net_spread_pct"), 0) > 0])
+        best_gross = max([safe_float(r.get("gross_spread_pct"), 0) for r in rows], default=0)
+        best_net = max([safe_float(r.get("net_spread_pct"), 0) for r in rows], default=0)
+
+        exchanges = set()
+        for r in rows:
+            exchanges.add(r.get("buy_exchange"))
+            exchanges.add(r.get("sell_exchange"))
+        exchange_count = len(exchanges)
+
+        top = None
+        for row in rows:
+            if top is None or safe_float(row.get("net_spread_pct"), 0) > safe_float(top.get("net_spread_pct"), 0):
+                top = row
+
+        line1 = f"Total Opportunities {total}  •  Positive Spreads {positive}  •  Exchanges {exchange_count}"
+        self.query_one("#arb-line-1", Label).update(line1)
+
+        if top:
+            top_symbol = top.get("symbol", "")
+            top_net = safe_float(top.get("net_spread_pct"), 0)
+            top_text = f"Top Symbol {top_symbol}  Net {top_net:+.3f}%"
         else:
-            spot_text += "  No opportunities"
+            top_text = "Top Symbol N/A  Net N/A"
 
-        # Format futures opportunity
-        futures_spread = futures.get('net_after_funding_pct', 0)
-        futures_icon = "✓" if futures_spread > 0.1 else "•"
-        futures_text = f"{futures_icon} FUTURES ARBITRAGE\n"
-        if futures:
-            futures_text += (
-                f"  {futures.get('symbol', 'N/A'):12} "
-                f"Buy: {futures.get('buy_exchange', 'N/A'):10} → "
-                f"Sell: {futures.get('sell_exchange', 'N/A'):10}\n"
-            )
-            futures_text += (
-                f"  Net Spread: {futures.get('net_spread_pct', 0):>6.2f}%  •  "
-                f"After Funding: {futures_spread:>6.2f}%"
-            )
+        line2 = f"Best Gross {best_gross:+.3f}%  •  Best Net {best_net:+.3f}%  •  {top_text}"
+        self.query_one("#arb-line-2", Label).update(line2)
+
+        # Top exchange pair
+        pair_best = None
+        pair_map: dict[str, dict] = {}
+        for row in rows:
+            key = f"{row.get('buy_exchange')}→{row.get('sell_exchange')}"
+            if key not in pair_map or safe_float(row.get("net_spread_pct"), 0) > safe_float(pair_map[key].get("net_spread_pct"), 0):
+                pair_map[key] = row
+        for row in pair_map.values():
+            if pair_best is None or safe_float(row.get("net_spread_pct"), 0) > safe_float(pair_best.get("net_spread_pct"), 0):
+                pair_best = row
+        if pair_best:
+            pair_label = f"{pair_best.get('buy_exchange')}→{pair_best.get('sell_exchange')}"
+            pair_net = safe_float(pair_best.get("net_spread_pct"), 0)
+            pair_text = f"Top Pair {pair_label} {pair_net:+.3f}%"
         else:
-            futures_text += "  No opportunities"
+            pair_text = "Top Pair N/A"
 
-        # Format DEX opportunity
-        dex_spread = dex.get('spread_pct', 0)
-        has_arb = dex.get('arbitrage', False)
-        dex_icon = "✓" if has_arb else "✗"
-        dex_text = f"{'✓' if dex_spread > 0.1 else '•'} DEX ARBITRAGE\n"
-        if dex:
-            status = "✓ YES" if has_arb else "✗ NO"
-            dex_text += (
-                f"  {dex.get('token', 'N/A'):12} / {dex.get('base_token', 'N/A'):6}  "
-                f"Best: {dex.get('best_dex', 'N/A'):12}\n"
-            )
-            dex_text += f"  Spread: {dex_spread:>6.2f}%  •  Arbitrage: {status}"
-        else:
-            dex_text += "  No opportunities"
+        exchanges_line = ""
+        if isinstance(self.health, dict):
+            ex = self.health.get("exchanges") or {}
+            if isinstance(ex, dict) and ex:
+                parts = [f"{k}: {v}" for k, v in list(ex.items())[:5]]
+                exchanges_line = "Exchanges " + "  ".join(parts)
+        elif rows:
+            counts: dict[str, int] = {}
+            for row in rows:
+                buy = row.get("buy_exchange")
+                sell = row.get("sell_exchange")
+                if buy:
+                    counts[buy] = counts.get(buy, 0) + 1
+                if sell:
+                    counts[sell] = counts.get(sell, 0) + 1
+            parts = [f"{k}: {v}" for k, v in list(counts.items())[:5]]
+            exchanges_line = "Exchanges " + "  ".join(parts)
+        line3 = f"{pair_text}  •  {exchanges_line}".strip()
+        self.query_one("#arb-line-3", Label).update(line3)
 
-        main = self.query_one("#arb-main", Container)
-        main.remove_children()
-        main.mount(
-            Container(
-                Label("⚖ Arbitrage Opportunities", classes="arb-title"),
-                Label(spot_text, classes="arb-spot"),
-                Label(futures_text, classes="arb-futures"),
-                Label(dex_text, classes="arb-dex"),
-                classes="arb-container",
+        status = f"[red]Error:[/red] {self.error_message}" if self.error_message else ""
+        self.query_one("#arb-status", Label).update(status)
+
+    def _sorted_rows(self) -> list[dict]:
+        rows = list(self.opportunities)
+        if not self.sort_column:
+            return rows
+        key = self.sort_column
+        reverse = self.sort_reverse
+
+        def sort_key(row: dict) -> Any:
+            val = row.get(key)
+            if isinstance(val, str):
+                return val.lower()
+            return safe_float(val, 0)
+
+        return sorted(rows, key=sort_key, reverse=reverse)
+
+    def _fmt_pct(self, value: Any) -> str:
+        val = safe_float(value, 0)
+        sign = "+" if val >= 0 else ""
+        return f"{sign}{val:.3f}%"
+
+    def _fmt_price(self, value: Any) -> str:
+        val = safe_float(value, 0)
+        return f"${val:,.2f}"
+
+    def _spread_color(self, value: Any) -> str:
+        return "#2dd4bf" if safe_float(value, 0) >= 0 else "#f87171"
+
+    def _update_table(self) -> None:
+        table = self.query_one("#arb-table", DataTable)
+        table.clear(columns=True)
+        for _key, label in self._column_defs():
+            table.add_column(label)
+
+        rows = self._sorted_rows()
+        if not rows:
+            table.add_row("No opportunities")
+            return
+
+        for row in rows:
+            gross = row.get("gross_spread_pct")
+            net = row.get("net_spread_pct")
+            gross_str = f"[{self._spread_color(gross)}]{self._fmt_pct(gross)}[/{self._spread_color(gross)}]"
+            net_str = f"[{self._spread_color(net)}]{self._fmt_pct(net)}[/{self._spread_color(net)}]"
+
+            cells = [
+                str(row.get("symbol", "")),
+                str(row.get("buy_exchange", "")),
+                str(row.get("sell_exchange", "")),
+                gross_str,
+                net_str,
+            ]
+            if self.market_type == "futures":
+                fund = row.get("funding_rate_diff")
+                net_fund = row.get("net_after_funding_pct")
+                fund_str = f"[{self._spread_color(fund)}]{self._fmt_pct(fund)}[/{self._spread_color(fund)}]"
+                net_fund_str = f"[{self._spread_color(net_fund)}]{self._fmt_pct(net_fund)}[/{self._spread_color(net_fund)}]"
+                cells.extend([fund_str, net_fund_str])
+            if self.market_type == "dex":
+                cells.extend(
+                    [
+                        self._fmt_price(row.get("spread_value")),
+                        self._fmt_price(row.get("buy_price")),
+                        self._fmt_price(row.get("sell_price")),
+                        "Profitable" if safe_float(net, 0) > 0 else "Not Profitable",
+                    ]
+                )
+            else:
+                cells.extend(
+                    [
+                        self._fmt_price(row.get("buy_price")),
+                        self._fmt_price(row.get("sell_price")),
+                        "Profitable" if safe_float(net, 0) > 0 else "Not Profitable",
+                    ]
+                )
+            table.add_row(*cells)
+
+    @staticmethod
+    def _normalize_dex_pairs(pairs: list[dict], base_token: str | None) -> list[dict]:
+        rows: list[dict] = []
+        for pair in pairs:
+            price_entries = [
+                (k.replace("_price", "").replace("_", " ").title(), v)
+                for k, v in pair.items()
+                if isinstance(k, str) and k.endswith("_price") and isinstance(v, (int, float))
+            ]
+            buy_exchange = "Unknown"
+            sell_exchange = "Unknown"
+            buy_price = float("inf")
+            sell_price = float("-inf")
+            for dex, price in price_entries:
+                if price < buy_price:
+                    buy_price = price
+                    buy_exchange = dex
+                if price > sell_price:
+                    sell_price = price
+                    sell_exchange = dex
+            if not isinstance(buy_price, (int, float)) or buy_price == float("inf"):
+                buy_price = 0.0
+            if not isinstance(sell_price, (int, float)) or sell_price == float("-inf"):
+                sell_price = 0.0
+            spread_pct = safe_float(pair.get("spread_pct"), 0)
+            spread_val = safe_float(pair.get("spread"), 0)
+            arbitrage = bool(pair.get("arbitrage"))
+            symbol = pair.get("token")
+            if base_token:
+                symbol = f"{symbol}/{base_token}"
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "buy_exchange": buy_exchange,
+                    "sell_exchange": sell_exchange,
+                    "gross_spread_pct": spread_pct,
+                    "net_spread_pct": spread_pct if arbitrage else -spread_pct,
+                    "spread_value": spread_val,
+                    "buy_price": buy_price,
+                    "sell_price": sell_price,
+                    "status": "Profitable" if arbitrage else "Not Profitable",
+                }
             )
-        )
+        return rows

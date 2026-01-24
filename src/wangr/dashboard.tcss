@@ -225,10 +225,49 @@ WhalesScreen #whale-content {
 }
 
 /* Arbitrage Screen */
-.arb-container {
-    border: solid $primary;
-    padding: 1 2;
-    margin: 1 0;
+#arb-wrapper {
+    width: 100%;
+    height: 100%;
+    align: center top;
+}
+
+#arb-summary {
+    padding: 1 2 0 2;
+    margin: 0 2 0 2;
+    height: auto;
+    width: 100%;
+    background: transparent;
+}
+
+#arb-toggle-row {
+    height: auto;
+    margin: 0 0 1 0;
+    align: center middle;
+}
+
+#arb-market-futures {
+    width: 13;
+    text-wrap: nowrap;
+}
+
+#arb-market-spot {
+    width: 11;
+    text-wrap: nowrap;
+}
+
+#arb-market-dex {
+    width: 9;
+    text-wrap: nowrap;
+}
+
+#arb-market-futures,
+#arb-market-spot {
+    text-wrap: nowrap;
+}
+
+.arb-header-label {
+    color: $text-muted;
+    margin: 0 1 0 0;
 }
 
 .arb-title {
@@ -237,19 +276,20 @@ WhalesScreen #whale-content {
     margin: 0 0 1 0;
 }
 
-.arb-spot {
-    color: $success;
-    margin: 0 0 1 0;
+.arb-summary {
+    color: $text-muted;
+    margin: 0 0 0 0;
 }
 
-.arb-futures {
-    color: $accent;
-    margin: 0 0 1 0;
-}
-
-.arb-dex {
+.arb-status {
     color: $warning;
     margin: 0;
+}
+
+#arb-table {
+    height: 1fr;
+    margin: 1 2 1 2;
+    width: 100%;
 }
 
 /* Whales Full Screen */
