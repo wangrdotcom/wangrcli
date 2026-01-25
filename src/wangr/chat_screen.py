@@ -121,11 +121,26 @@ class ChatScreen(Screen):
         if event.state.name == "SUCCESS":
             self._stop_processing()
             response, tool_calls = event.worker.result
-            self._append_assistant_message(response, tool_calls)
-            if self._pending_file_ops:
+            logger.info("Worker completed: response=%r, pending_ops=%s, requires_approval=%s",
+                        response[:50] if response else None,
+                        bool(self._pending_file_ops),
+                        self._pending_requires_approval)
+            # Check for pending marker - prepare prompt on main thread
+            if response == "__PENDING__" and self._pending_file_ops:
+                logger.info("Preparing pending prompt on main thread")
+                prompt = self._prepare_pending_prompt(self._pending_file_ops)
+                logger.info("Pending prompt: %r, requires_approval=%s", prompt, self._pending_requires_approval)
+                if prompt:
+                    self._append_assistant_message(prompt, [])
+                input_box.disabled = True
+                self.focus()
+            elif self._pending_file_ops:
+                logger.info("Has pending ops but not __PENDING__ marker")
+                self._append_assistant_message(response, tool_calls)
                 input_box.disabled = True
                 self.focus()
             else:
+                self._append_assistant_message(response, tool_calls)
                 input_box.disabled = False
                 input_box.focus()
         elif event.state.name == "ERROR":
@@ -146,11 +161,19 @@ class ChatScreen(Screen):
             response_id = data.get("response_id")
             pending = data.get("pending_file_ops")
             if pending:
+                logger.info("_real_chat_request: Got pending_file_ops, id=%s", pending.get("id"))
                 self._pending_file_ops = pending
                 self._auto_approve_chain = False
-                prompt = self._prepare_pending_prompt(pending)
+                # Check if approval is needed without updating UI from worker thread
+                _preview, approvable, _auto_outputs = self._categorize_patch_ops(pending)
+                self._pending_requires_approval = bool(approvable)
+                logger.info("_real_chat_request: requires_approval=%s, approvable_count=%d",
+                           self._pending_requires_approval, len(approvable) if approvable else 0)
                 if self._pending_requires_approval:
-                    return prompt, []
+                    # Return marker - main thread will prepare the prompt
+                    logger.info("_real_chat_request: Returning __PENDING__ marker")
+                    return "__PENDING__", []
+                logger.info("_real_chat_request: Auto-approving (no approvable ops)")
                 reply, _ = self._resolve_pending_request(True)
                 self._history.append({"role": "user", "content": message})
                 self._history.append({"role": "assistant", "content": reply})
@@ -211,13 +234,17 @@ class ChatScreen(Screen):
         return response.json()
 
     def _resolve_pending_request(self, approved: bool) -> tuple[str, list[dict[str, Any]]]:
+        logger.info("_resolve_pending_request: approved=%s, auto_approve_chain=%s", approved, self._auto_approve_chain)
         pending = self._pending_file_ops
         if not pending:
+            logger.info("_resolve_pending_request: No pending operations")
             return "No pending operations.", []
         if approved and self._auto_approve_chain:
+            logger.info("_resolve_pending_request: Auto-approve chain active")
             response = ""
             remaining = pending
-            for _ in range(20):
+            for i in range(20):
+                logger.info("_resolve_pending_request: Auto-approve iteration %d", i)
                 response, next_pending, _auto_approved = self._resolve_pending(
                     remaining, True, True
                 )
@@ -228,16 +255,21 @@ class ChatScreen(Screen):
             self._pending_file_ops = remaining
             self._auto_approve_chain = True
             self._pending_requires_approval = False
+            logger.info("_resolve_pending_request: Auto-approve done, remaining=%s", bool(remaining))
             return response, []
         response, next_pending, auto_approved = self._resolve_pending(
             pending, approved, self._auto_approve_chain
         )
+        logger.info("_resolve_pending_request: After resolve, next_pending=%s, auto_approved=%s", bool(next_pending), auto_approved)
         self._pending_file_ops = next_pending
         self._auto_approve_chain = auto_approved
         if self._pending_file_ops:
-            prompt = self._prepare_pending_prompt(self._pending_file_ops)
-            return prompt, []
+            # Return marker to signal main thread should prepare pending prompt
+            # Don't call _prepare_pending_prompt here as it updates UI from worker thread
+            logger.info("_resolve_pending_request: More pending ops, returning __PENDING__")
+            return "__PENDING__", []
         self._pending_requires_approval = False
+        logger.info("_resolve_pending_request: Done, returning response")
         return response, []
 
     def _prepare_pending_prompt(self, pending: dict[str, Any]) -> str:
@@ -277,6 +309,9 @@ class ChatScreen(Screen):
         return Group(*rendered)
 
     def on_key(self, event: events.Key) -> None:
+        logger.info("on_key: key=%s, pending_ops=%s, requires_approval=%s, worker_running=%s",
+                    event.key, bool(self._pending_file_ops), self._pending_requires_approval,
+                    self._worker.is_running if self._worker else False)
         if not self._pending_file_ops or not self._pending_requires_approval:
             return
         if self._worker and self._worker.is_running:
@@ -286,6 +321,7 @@ class ChatScreen(Screen):
             return
         event.stop()
         approved = key == "y"
+        logger.info("on_key: Processing approval=%s", approved)
         input_box = self.query_one("#chat-input", Input)
         input_box.value = ""
         input_box.disabled = True
