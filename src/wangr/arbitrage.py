@@ -212,6 +212,14 @@ class ArbitrageScreen(Screen):
             self._on_sort_selected,
         )
 
+    def _on_sort_selected(self, result: dict | None) -> None:
+        """Handle sort modal result."""
+        if result is None:
+            return
+        self.sort_column = result.get("key")
+        self.sort_reverse = result.get("reverse", True)
+        self._update_table()
+
     def action_toggle_sort_direction(self) -> None:
         if self.sort_column is None:
             self.sort_column = self._column_defs()[0][0]
