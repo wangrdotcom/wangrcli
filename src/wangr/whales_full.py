@@ -4,7 +4,6 @@ import logging
 from functools import partial
 from typing import Optional
 
-import requests
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
@@ -22,15 +21,17 @@ from wangr.config import (
     SOL_WHALES_API_URL,
     THOUSAND,
 )
+from wangr.api import get_json
 from wangr.hyperliquid import fetch_prices
-from wangr.sort_modal import SortModal
+from wangr.tab_highlight import update_active_tab
+from wangr.table_screen import SortableTableMixin
 from wangr.sparkline import mini_bar
 from wangr.utils import format_price, safe_division, safe_float
 
 logger = logging.getLogger(__name__)
 
 
-class WhalesFullScreen(Screen):
+class WhalesFullScreen(SortableTableMixin, Screen):
     """Screen displaying sortable whale positions across BTC, ETH, and SOL."""
 
     BINDINGS = [
@@ -61,6 +62,9 @@ class WhalesFullScreen(Screen):
         ("trades", "Trades"),
         ("liq", "Liquidation"),
     ]
+
+    SORT_COLUMNS = COLUMN_DEFS
+    TABLE_SELECTOR = "#whales-table"
 
     selected_coin: reactive[str] = reactive("BTC")
 
@@ -93,8 +97,6 @@ class WhalesFullScreen(Screen):
         self._eth_worker: Optional[Worker] = None
         self._sol_worker: Optional[Worker] = None
         self._price_worker: Optional[Worker] = None
-        self._pending_g = False
-        self._g_timer = None
 
     def _get_current_price(self) -> float:
         """Get the current price for the selected coin."""
@@ -262,17 +264,11 @@ class WhalesFullScreen(Screen):
 
     def _fetch_whale_data(self, url: str) -> list:
         """Fetch whale data from API."""
-        try:
-            resp = requests.get(url, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("active_whales", [])[:30]
-        except requests.RequestException as e:
-            logger.error(f"Error fetching whale data from {url}: {e}")
+        data, err = get_json(url, timeout=API_TIMEOUT)
+        if err or not isinstance(data, dict):
+            logger.error("Error fetching whale data from %s: %s", url, err)
             return []
-        except ValueError as e:
-            logger.error(f"Error parsing JSON from {url}: {e}")
-            return []
+        return data.get("active_whales", [])[:30]
 
     async def on_mount(self) -> None:
         """Mount handler - start data fetching."""
@@ -289,9 +285,7 @@ class WhalesFullScreen(Screen):
         if self.update_timer:
             self.update_timer.stop()
             self.update_timer = None
-        if self._g_timer:
-            self._g_timer.stop()
-            self._g_timer = None
+        self._clear_pending_g()
 
         # Cancel all workers to prevent memory leak
         if self._btc_worker and self._btc_worker.is_running:
@@ -626,93 +620,23 @@ class WhalesFullScreen(Screen):
         """Go back to previous screen."""
         self.app.pop_screen()
 
-    def action_cursor_down(self) -> None:
-        """Move table cursor down."""
-        self.query_one("#whales-table", DataTable).action_cursor_down()
+    # Table navigation inherited from SortableTableMixin.
 
-    def action_cursor_up(self) -> None:
-        """Move table cursor up."""
-        self.query_one("#whales-table", DataTable).action_cursor_up()
-
-    def action_page_down(self) -> None:
-        """Move table cursor one page down."""
-        self.query_one("#whales-table", DataTable).action_page_down()
-
-    def action_page_up(self) -> None:
-        """Move table cursor one page up."""
-        self.query_one("#whales-table", DataTable).action_page_up()
-
-    def action_cursor_top(self) -> None:
-        """Move table cursor to top."""
-        table = self.query_one("#whales-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=0)
-
-    def action_cursor_bottom(self) -> None:
-        """Move table cursor to bottom."""
-        table = self.query_one("#whales-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=table.row_count - 1)
-    def action_sort_by_column(self) -> None:
-        """Open sort dialog."""
-        self.app.push_screen(
-            SortModal(self.COLUMN_DEFS, self.sort_column, self.sort_reverse),
-            self._on_sort_selected,
-        )
-
-    def action_toggle_sort_direction(self) -> None:
-        """Toggle current sort direction."""
-        if self.sort_column is None:
-            self.sort_column = self.COLUMN_DEFS[0][0]
-        self.sort_reverse = not self.sort_reverse
-        self._update_whale_display()
-
-    def on_key(self, event: events.Key) -> None:
-        """Handle vim-style gg jump."""
-        if event.key == "g":
-            event.prevent_default()
-            if self._pending_g:
-                self._pending_g = False
-                if self._g_timer:
-                    self._g_timer.stop()
-                    self._g_timer = None
-                self.action_cursor_top()
-            else:
-                self._pending_g = True
-                if self._g_timer:
-                    self._g_timer.stop()
-                self._g_timer = self.set_timer(0.5, self._clear_pending_g)
-        else:
-            self._clear_pending_g()
-
-    def _clear_pending_g(self) -> None:
-        """Clear pending g state."""
-        self._pending_g = False
-        if self._g_timer:
-            self._g_timer.stop()
-            self._g_timer = None
-
-    def _on_sort_selected(self, result: dict | None) -> None:
-        """Apply sort selection from modal."""
-        if not result:
-            return
-        self.sort_column = result.get("key")
-        self.sort_reverse = result.get("reverse", self.sort_reverse)
+    def _refresh_table(self) -> None:
         self._update_whale_display()
 
     def _update_coin_classes(self, new_coin: str) -> None:
         """Update coin label styles based on selection."""
-        mapping = {
-            "BTC": "#coin-btc",
-            "ETH": "#coin-eth",
-            "SOL": "#coin-sol",
-        }
-        for key, selector in mapping.items():
-            label = self.query_one(selector, Static)
-            if key == new_coin:
-                label.add_class("coin-toggle-active")
-            else:
-                label.remove_class("coin-toggle-active")
+        update_active_tab(
+            self,
+            {
+                "BTC": "#coin-btc",
+                "ETH": "#coin-eth",
+                "SOL": "#coin-sol",
+            },
+            new_coin,
+            active_class="coin-toggle-active",
+        )
 
     def _update_cache(self) -> None:
         """Cache latest whales lists on the app."""

@@ -6,7 +6,6 @@ import logging
 from datetime import datetime
 from typing import Any, Optional
 
-import requests
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
@@ -23,14 +22,16 @@ from wangr.config import (
     POLYMARKET_TRADER_API_URL,
     POLYMARKET_WHALES_API_URL,
 )
-from wangr.sort_modal import SortModal
+from wangr.api import get_json
+from wangr.table_screen import SortableTableMixin
 from wangr.sparkline import mini_bar
+from wangr.formatters import fmt_pct, fmt_usd, pnl_color
 from wangr.utils import format_bar, safe_division, safe_float
 
 logger = logging.getLogger(__name__)
 
 
-class PolymarketWhalesScreen(Screen):
+class PolymarketWhalesScreen(SortableTableMixin, Screen):
     """Screen displaying Polymarket whales with filters, sorting, and details."""
 
     BINDINGS = [
@@ -56,6 +57,8 @@ class PolymarketWhalesScreen(Screen):
         ("analyzed_at", "Analyzed"),
         ("qualification", "Tags"),
     ]
+    SORT_COLUMNS = COLUMN_DEFS
+    TABLE_SELECTOR = "#polywhale-table"
 
     selected_wallet: reactive[str | None] = reactive(None)
 
@@ -88,8 +91,6 @@ class PolymarketWhalesScreen(Screen):
         self._whales_worker: Optional[Worker] = None
         self._details_worker: Optional[Worker] = None
         self._positions_worker: Optional[Worker] = None
-        self._pending_g = False
-        self._g_timer = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -164,6 +165,7 @@ class PolymarketWhalesScreen(Screen):
         for worker in (self._whales_worker, self._details_worker, self._positions_worker):
             if worker and worker.is_running:
                 worker.cancel()
+        self._clear_pending_g()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "polywhale-table":
@@ -183,63 +185,18 @@ class PolymarketWhalesScreen(Screen):
         focused = self.focused
         if not isinstance(focused, DataTable) or focused.id != "polywhale-table":
             return
-        if event.key == "g":
-            event.prevent_default()
-            if self._pending_g:
-                self._pending_g = False
-                if self._g_timer:
-                    self._g_timer.stop()
-                    self._g_timer = None
-                self.action_cursor_top()
-            else:
-                self._pending_g = True
-                if self._g_timer:
-                    self._g_timer.stop()
-                self._g_timer = self.set_timer(0.5, self._clear_pending_g)
-        elif event.key == "enter":
+        if self._handle_gg(event, require_table_id="polywhale-table"):
+            return
+        if event.key == "enter":
             event.stop()
             self.action_toggle_details()
         else:
             self._clear_pending_g()
 
-    def action_cursor_down(self) -> None:
-        self.query_one("#polywhale-table", DataTable).action_cursor_down()
-
-    def action_cursor_up(self) -> None:
-        self.query_one("#polywhale-table", DataTable).action_cursor_up()
-
-    def action_page_down(self) -> None:
-        self.query_one("#polywhale-table", DataTable).action_page_down()
-
-    def action_page_up(self) -> None:
-        self.query_one("#polywhale-table", DataTable).action_page_up()
-
-    def action_cursor_top(self) -> None:
-        table = self.query_one("#polywhale-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=0)
-
-    def action_cursor_bottom(self) -> None:
-        table = self.query_one("#polywhale-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=table.row_count - 1)
-
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
-    def action_sort_by_column(self) -> None:
-        """Open sort dialog."""
-        self.app.push_screen(
-            SortModal(self.COLUMN_DEFS, self.sort_column, self.sort_reverse),
-            self._on_sort_selected,
-        )
-
-    def action_toggle_sort_direction(self) -> None:
-        """Toggle current sort direction."""
-        if self.sort_column is None:
-            self.sort_column = self.COLUMN_DEFS[0][0]
-        self.sort_reverse = not self.sort_reverse
-        self._update_table_display()
+    # Table navigation and sorting inherited from SortableTableMixin.
 
     def action_toggle_details(self) -> None:
         wallet = self.selected_wallet or self._current_wallet_from_table()
@@ -279,21 +236,15 @@ class PolymarketWhalesScreen(Screen):
         self._whales_worker = self.run_worker(self._fetch_whales_data, thread=True, name="polywhales")
 
     def _fetch_whales_data(self) -> dict[str, Any]:
-        try:
-            resp = requests.get(POLYMARKET_WHALES_API_URL, headers=self._headers, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            return {
-                "whales": data.get("whales", []) or [],
-                "count": data.get("count") or 0,
-                "error": None,
-            }
-        except requests.RequestException as exc:
-            logger.error("Failed to fetch whales: %s", exc)
-            return {"whales": [], "count": 0, "error": str(exc)}
-        except ValueError as exc:
-            logger.error("Failed to parse whales JSON: %s", exc)
-            return {"whales": [], "count": 0, "error": str(exc)}
+        data, err = get_json(POLYMARKET_WHALES_API_URL, headers=self._headers, timeout=API_TIMEOUT)
+        if err or not isinstance(data, dict):
+            logger.error("Failed to fetch whales: %s", err)
+            return {"whales": [], "count": 0, "error": err or "Failed to fetch whales"}
+        return {
+            "whales": data.get("whales", []) or [],
+            "count": data.get("count") or 0,
+            "error": None,
+        }
 
     def _fetch_details(self, wallet: str) -> None:
         if self.loading_details.get(wallet):
@@ -306,20 +257,15 @@ class PolymarketWhalesScreen(Screen):
         )
 
     def _fetch_trader_details(self, wallet: str) -> dict[str, Any]:
-        try:
-            resp = requests.get(
-                f"{POLYMARKET_TRADER_API_URL}/{wallet}",
-                headers=self._headers,
-                timeout=API_TIMEOUT,
-            )
-            resp.raise_for_status()
-            return {"wallet": wallet, "payload": resp.json()}
-        except requests.RequestException as exc:
-            logger.error("Failed to fetch trader details: %s", exc)
-            return {"error": str(exc), "wallet": wallet}
-        except ValueError as exc:
-            logger.error("Failed to parse trader details JSON: %s", exc)
-            return {"error": str(exc), "wallet": wallet}
+        data, err = get_json(
+            f"{POLYMARKET_TRADER_API_URL}/{wallet}",
+            headers=self._headers,
+            timeout=API_TIMEOUT,
+        )
+        if err or not isinstance(data, dict):
+            logger.error("Failed to fetch trader details: %s", err)
+            return {"error": err or "Failed to fetch trader details", "wallet": wallet}
+        return {"wallet": wallet, "payload": data}
 
     def _fetch_positions(self, wallet: str) -> None:
         if self.loading_positions.get(wallet):
@@ -332,21 +278,16 @@ class PolymarketWhalesScreen(Screen):
         )
 
     def _fetch_positions_data(self, wallet: str) -> dict[str, Any]:
-        try:
-            resp = requests.get(
-                f"{POLYMARKET_TRADER_API_URL}/{wallet}",
-                params={"include_positions": "true"},
-                headers=self._headers,
-                timeout=API_TIMEOUT,
-            )
-            resp.raise_for_status()
-            return {"wallet": wallet, "positions": resp.json().get("all_positions", [])}
-        except requests.RequestException as exc:
-            logger.error("Failed to fetch positions: %s", exc)
-            return {"wallet": wallet, "positions": [], "error": str(exc)}
-        except ValueError as exc:
-            logger.error("Failed to parse positions JSON: %s", exc)
-            return {"wallet": wallet, "positions": [], "error": str(exc)}
+        data, err = get_json(
+            f"{POLYMARKET_TRADER_API_URL}/{wallet}",
+            params={"include_positions": "true"},
+            headers=self._headers,
+            timeout=API_TIMEOUT,
+        )
+        if err or not isinstance(data, dict):
+            logger.error("Failed to fetch positions: %s", err)
+            return {"wallet": wallet, "positions": [], "error": err or "Failed to fetch positions"}
+        return {"wallet": wallet, "positions": data.get("all_positions", [])}
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.state.name != "SUCCESS":
@@ -409,8 +350,11 @@ class PolymarketWhalesScreen(Screen):
         )
         self.query_one("#polywhale-profit-bar", Label).update(bar)
 
-        pnl_color = "#2dd4bf" if total_pnl >= 0 else "#f87171"
-        total_line = f"Total Portfolio ${total_port:.2f}M    Total PnL [{pnl_color}]{total_pnl:+.2f}M[/{pnl_color}]"
+        total_pnl_color = "#2dd4bf" if total_pnl >= 0 else "#f87171"
+        total_line = (
+            f"Total Portfolio ${total_port:.2f}M    "
+            f"Total PnL [{total_pnl_color}]{total_pnl:+.2f}M[/{total_pnl_color}]"
+        )
         self.query_one("#polywhale-total-line", Label).update(total_line)
 
         mean_port = safe_division(poly.get("mean_portfolio_value", 0), THOUSAND)
@@ -478,12 +422,7 @@ class PolymarketWhalesScreen(Screen):
             row = [wallet, f"{portfolio:,.0f}", pnl_str, analyzed_fmt, tags]
             table.add_row(*row, key=wallet)
 
-    def _on_sort_selected(self, result: dict | None) -> None:
-        """Apply sort selection from modal."""
-        if not result:
-            return
-        self.sort_column = result.get("key")
-        self.sort_reverse = result.get("reverse", self.sort_reverse)
+    def _refresh_table(self) -> None:
         self._update_table_display()
 
     def _update_details_display(self) -> None:
@@ -499,11 +438,11 @@ class PolymarketWhalesScreen(Screen):
         pnl = safe_float(whale.get("total_pnl"), 0)
         analyzed = whale.get("analyzed_at", "")
         analyzed_fmt = self._format_date(analyzed)
-        pnl_color = "#2dd4bf" if pnl >= 0 else "#f87171"
+        pnl_color_code = "#2dd4bf" if pnl >= 0 else "#f87171"
         title = (
             f"[bold]{wallet[:6]}…{wallet[-4:]}[/bold]  "
             f"[dim]Portfolio[/dim] ${portfolio:,.2f}  "
-            f"[{pnl_color}]PnL {pnl:+,.2f}[/{pnl_color}]  "
+            f"[{pnl_color_code}]PnL {pnl:+,.2f}[/{pnl_color_code}]  "
             f"[dim]{analyzed_fmt}[/dim]"
         )
         self.query_one("#polywhale-details-title", Label).update(title)
@@ -529,10 +468,10 @@ class PolymarketWhalesScreen(Screen):
         closed = details.get("closed_positions", {})
         open_pos = details.get("open_positions", {})
 
-        win_rate = _fmt_pct(closed.get("win_rate"))
-        open_pnl = _fmt_usd(open_pos.get("pnl"))
-        closed_pnl = _fmt_usd(closed.get("pnl"))
-        vol = _fmt_usd(details.get("recent_volume"))
+        win_rate = fmt_pct(closed.get("win_rate"), decimals=1)
+        open_pnl = fmt_usd(open_pos.get("pnl"))
+        closed_pnl = fmt_usd(closed.get("pnl"))
+        vol = fmt_usd(details.get("recent_volume"))
 
         self.query_one("#polywhale-stat-win-label", Label).update("[dim]WIN RATE[/dim]")
         self.query_one("#polywhale-stat-win-value", Label).update(f"[bold]{win_rate}[/bold]")
@@ -542,7 +481,7 @@ class PolymarketWhalesScreen(Screen):
 
         self.query_one("#polywhale-stat-open-label", Label).update("[dim]OPEN PNL[/dim]")
         self.query_one("#polywhale-stat-open-value", Label).update(
-            f"[{_pnl_color(open_pos.get('pnl'))}]{open_pnl}[/{_pnl_color(open_pos.get('pnl'))}]"
+            f"[{pnl_color(open_pos.get('pnl'))}]{open_pnl}[/{pnl_color(open_pos.get('pnl'))}]"
         )
         self.query_one("#polywhale-stat-open-sub", Label).update(
             f"[dim]{open_pos.get('count', 0)} Pos[/dim]"
@@ -550,7 +489,7 @@ class PolymarketWhalesScreen(Screen):
 
         self.query_one("#polywhale-stat-closed-label", Label).update("[dim]CLOSED PNL[/dim]")
         self.query_one("#polywhale-stat-closed-value", Label).update(
-            f"[{_pnl_color(closed.get('pnl'))}]{closed_pnl}[/{_pnl_color(closed.get('pnl'))}]"
+            f"[{pnl_color(closed.get('pnl'))}]{closed_pnl}[/{pnl_color(closed.get('pnl'))}]"
         )
         self.query_one("#polywhale-stat-closed-sub", Label).update(
             f"[dim]{closed.get('count', 0)} Pos[/dim]"
@@ -599,9 +538,9 @@ class PolymarketWhalesScreen(Screen):
             for pos in open_positions:
                 open_table.add_row(
                     str(pos.get("market", "")),
-                    _fmt_usd(pos.get("size")),
-                    _fmt_usd(pos.get("pnl")),
-                    _fmt_pct(pos.get("percent_pnl")),
+                    fmt_usd(pos.get("size")),
+                    fmt_usd(pos.get("pnl")),
+                    fmt_pct(pos.get("percent_pnl"), decimals=1),
                 )
 
         if not closed_positions:
@@ -610,8 +549,8 @@ class PolymarketWhalesScreen(Screen):
             for pos in closed_positions:
                 closed_table.add_row(
                     str(pos.get("market", "")),
-                    _fmt_usd(pos.get("pnl")),
-                    _fmt_pct(pos.get("percent_pnl")),
+                    fmt_usd(pos.get("pnl")),
+                    fmt_pct(pos.get("percent_pnl"), decimals=1),
                 )
 
     def _update_positions_table(self) -> None:
@@ -648,11 +587,7 @@ class PolymarketWhalesScreen(Screen):
         except Exception:
             return None
 
-    def _clear_pending_g(self) -> None:
-        self._pending_g = False
-        if self._g_timer:
-            self._g_timer.stop()
-            self._g_timer = None
+    # _clear_pending_g inherited from TableNavigationMixin.
 
     @staticmethod
     def _row_key_to_wallet(row_key: Any) -> str | None:
@@ -724,33 +659,6 @@ class PolymarketWhalesScreen(Screen):
             return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d")
         except ValueError:
             return value
-
-
-def _fmt_pct(value: Any) -> str:
-    if value is None:
-        return ""
-    try:
-        return f"{float(value):.1f}%"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _fmt_usd(value: Any) -> str:
-    if value is None:
-        return "$0"
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return f"${num:,.0f}"
-
-
-def _pnl_color(value: Any) -> str:
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return "text"
-    return "#2dd4bf" if num >= 0 else "#f87171"
 
 
 def _infer_position_columns(positions: list[dict]) -> list[tuple[str, str]]:

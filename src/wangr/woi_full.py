@@ -5,8 +5,6 @@ from datetime import datetime
 from functools import partial
 from typing import Optional
 
-import requests
-from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
 from textual.reactive import reactive
@@ -22,14 +20,15 @@ from wangr.config import (
     THOUSAND,
     WOI_TRACKED_USERS_API_URL,
 )
-from wangr.sort_modal import SortModal
+from wangr.api import get_json
+from wangr.table_screen import SortableTableMixin
 from wangr.sparkline import mini_bar
 from wangr.utils import format_time, safe_division, safe_float
 
 logger = logging.getLogger(__name__)
 
 
-class WOIFullScreen(Screen):
+class WOIFullScreen(SortableTableMixin, Screen):
     """Screen displaying Wallets of Interest with summary header and sortable table."""
 
     BINDINGS = [
@@ -60,6 +59,8 @@ class WOIFullScreen(Screen):
         ("last_close_time", "Last Close"),
         ("symbols_count", "Symbols"),
     ]
+    SORT_COLUMNS = COLUMN_DEFS
+    TABLE_SELECTOR = "#woi-table"
 
     def __init__(self, data: dict, cache: dict | None = None) -> None:
         """Initialize WOI full screen with data."""
@@ -80,8 +81,6 @@ class WOIFullScreen(Screen):
         self.update_timer = None
         self._users_worker: Optional[Worker] = None
         self._agg_worker: Optional[Worker] = None
-        self._pending_g = False
-        self._g_timer = None
 
     def _calc_heat(self, user: dict) -> float:
         """Calculate heat score: (wins × win_rate × pnl) / 1000."""
@@ -149,25 +148,19 @@ class WOIFullScreen(Screen):
 
     def _fetch_users(self) -> list:
         """Fetch users from tracked API."""
-        try:
-            resp = requests.get(WOI_TRACKED_USERS_API_URL, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("users", [])
-        except requests.RequestException as e:
-            logger.error(f"Error fetching WOI users: {e}")
+        data, err = get_json(WOI_TRACKED_USERS_API_URL, timeout=API_TIMEOUT)
+        if err or not isinstance(data, dict):
+            logger.error("Error fetching WOI users: %s", err)
             return []
+        return data.get("users", [])
 
     def _fetch_aggregates(self) -> dict:
         """Fetch aggregates from frontpage API."""
-        try:
-            resp = requests.get(FRONTPAGE_API_URL, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("woi", {})
-        except requests.RequestException as e:
-            logger.error(f"Error fetching WOI aggregates: {e}")
+        data, err = get_json(FRONTPAGE_API_URL, timeout=API_TIMEOUT)
+        if err or not isinstance(data, dict):
+            logger.error("Error fetching WOI aggregates: %s", err)
             return {}
+        return data.get("woi", {})
 
     async def on_mount(self) -> None:
         """Mount handler - start data fetching."""
@@ -183,9 +176,7 @@ class WOIFullScreen(Screen):
         if self.update_timer:
             self.update_timer.stop()
             self.update_timer = None
-        if self._g_timer:
-            self._g_timer.stop()
-            self._g_timer = None
+        self._clear_pending_g()
         if self._users_worker and self._users_worker.is_running:
             self._users_worker.cancel()
         if self._agg_worker and self._agg_worker.is_running:
@@ -430,79 +421,9 @@ class WOIFullScreen(Screen):
         """Go back to previous screen."""
         self.app.pop_screen()
 
-    def action_cursor_down(self) -> None:
-        """Move table cursor down."""
-        self.query_one("#woi-table", DataTable).action_cursor_down()
+    # Table navigation and sorting inherited from SortableTableMixin.
 
-    def action_cursor_up(self) -> None:
-        """Move table cursor up."""
-        self.query_one("#woi-table", DataTable).action_cursor_up()
-
-    def action_page_down(self) -> None:
-        """Move table cursor one page down."""
-        self.query_one("#woi-table", DataTable).action_page_down()
-
-    def action_page_up(self) -> None:
-        """Move table cursor one page up."""
-        self.query_one("#woi-table", DataTable).action_page_up()
-
-    def action_cursor_top(self) -> None:
-        """Move table cursor to top."""
-        table = self.query_one("#woi-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=0)
-
-    def action_cursor_bottom(self) -> None:
-        """Move table cursor to bottom."""
-        table = self.query_one("#woi-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=table.row_count - 1)
-
-    def action_sort_by_column(self) -> None:
-        """Open sort dialog."""
-        self.app.push_screen(
-            SortModal(self.COLUMN_DEFS, self.sort_column, self.sort_reverse),
-            self._on_sort_selected,
-        )
-
-    def action_toggle_sort_direction(self) -> None:
-        """Toggle current sort direction."""
-        if self.sort_column is None:
-            self.sort_column = "heat"
-        self.sort_reverse = not self.sort_reverse
-        self._update_table_display()
-
-    def on_key(self, event: events.Key) -> None:
-        """Handle vim-style gg jump."""
-        if event.key == "g":
-            event.prevent_default()
-            if self._pending_g:
-                self._pending_g = False
-                if self._g_timer:
-                    self._g_timer.stop()
-                    self._g_timer = None
-                self.action_cursor_top()
-            else:
-                self._pending_g = True
-                if self._g_timer:
-                    self._g_timer.stop()
-                self._g_timer = self.set_timer(0.5, self._clear_pending_g)
-        else:
-            self._clear_pending_g()
-
-    def _clear_pending_g(self) -> None:
-        """Clear pending g state."""
-        self._pending_g = False
-        if self._g_timer:
-            self._g_timer.stop()
-            self._g_timer = None
-
-    def _on_sort_selected(self, result: dict | None) -> None:
-        """Apply sort selection from modal."""
-        if not result:
-            return
-        self.sort_column = result.get("key")
-        self.sort_reverse = result.get("reverse", self.sort_reverse)
+    def _refresh_table(self) -> None:
         self._update_table_display()
 
     def _update_cache(self) -> None:

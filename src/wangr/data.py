@@ -1,10 +1,8 @@
 """Data fetching utilities."""
 
-import json
 import logging
 
-import requests
-
+from wangr.api import get_json
 from wangr.config import (
     API_TIMEOUT,
     ARBITRAGE_API_URL,
@@ -25,16 +23,11 @@ def fetch_dashboard_data() -> dict:
     Returns:
         Dictionary with dashboard data, or empty dict on error
     """
-    try:
-        response = requests.get(FRONTPAGE_API_URL, timeout=API_TIMEOUT)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logger.error(f"Error fetching data from {FRONTPAGE_API_URL}: {e}")
+    data, err = get_json(FRONTPAGE_API_URL, timeout=API_TIMEOUT)
+    if err or not isinstance(data, dict):
+        logger.error("Error fetching dashboard data from %s: %s", FRONTPAGE_API_URL, err)
         return {}
-    except json.JSONDecodeError as e:
-        logger.error(f"Error parsing JSON from {FRONTPAGE_API_URL}: {e}")
-        return {}
+    return data
 
 
 def fetch_whales_full_data() -> dict:
@@ -45,17 +38,11 @@ def fetch_whales_full_data() -> dict:
         Dictionary with whales lists, or empty lists on error.
     """
     def fetch(url: str) -> list:
-        try:
-            resp = requests.get(url, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("active_whales", [])[:30]
-        except requests.RequestException as e:
-            logger.error(f"Error fetching whale data from {url}: {e}")
+        data, err = get_json(url, timeout=API_TIMEOUT)
+        if err or not isinstance(data, dict):
+            logger.error("Error fetching whale data from %s: %s", url, err)
             return []
-        except ValueError as e:
-            logger.error(f"Error parsing JSON from {url}: {e}")
-            return []
+        return data.get("active_whales", [])[:30]
 
     return {
         "whales_btc": fetch(BTC_WHALES_API_URL),
@@ -71,14 +58,11 @@ def fetch_woi_full_data() -> dict:
     Returns:
         Dictionary with users list, or empty list on error.
     """
-    try:
-        resp = requests.get(WOI_TRACKED_USERS_API_URL, timeout=API_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        return {"users": data.get("users", [])}
-    except requests.RequestException as e:
-        logger.error(f"Error fetching WOI full data from {WOI_TRACKED_USERS_API_URL}: {e}")
+    data, err = get_json(WOI_TRACKED_USERS_API_URL, timeout=API_TIMEOUT)
+    if err or not isinstance(data, dict):
+        logger.error("Error fetching WOI full data from %s: %s", WOI_TRACKED_USERS_API_URL, err)
         return {"users": []}
+    return {"users": data.get("users", [])}
 
 
 def fetch_arbitrage_data(market: str = "futures") -> dict:
@@ -92,23 +76,16 @@ def fetch_arbitrage_data(market: str = "futures") -> dict:
         Dictionary with opportunities, health, and market.
     """
     prefix = "/futures" if market == "futures" else ""
-    try:
-        health_resp = requests.get(f"{ARBITRAGE_API_URL}{prefix}/health", timeout=API_TIMEOUT)
-        top_resp = requests.get(
-            f"{ARBITRAGE_API_URL}{prefix}/arbitrage/top",
-            params={"limit": 50, "min_net_pct": -999},
-            timeout=API_TIMEOUT,
-        )
-        if not health_resp.ok or not top_resp.ok:
-            return {"market": market, "opportunities": [], "health": None}
-        return {
-            "market": market,
-            "opportunities": top_resp.json(),
-            "health": health_resp.json(),
-        }
-    except requests.RequestException as e:
-        logger.error(f"Error fetching arbitrage data from {ARBITRAGE_API_URL}: {e}")
+    health, err = get_json(f"{ARBITRAGE_API_URL}{prefix}/health", timeout=API_TIMEOUT)
+    top, err_top = get_json(
+        f"{ARBITRAGE_API_URL}{prefix}/arbitrage/top",
+        params={"limit": 50, "min_net_pct": -999},
+        timeout=API_TIMEOUT,
+    )
+    if err or err_top or not isinstance(top, list):
+        logger.error("Error fetching arbitrage data from %s: %s %s", ARBITRAGE_API_URL, err, err_top)
         return {"market": market, "opportunities": [], "health": None}
+    return {"market": market, "opportunities": top, "health": health if isinstance(health, dict) else None}
 
 
 def fetch_arbitrage_dex_data() -> dict:
@@ -118,31 +95,21 @@ def fetch_arbitrage_dex_data() -> dict:
     Returns:
         Dictionary with base_token, amount_in_wei, pairs, and missing_pairs.
     """
-    try:
-        resp = requests.get(f"{ARBITRAGE_API_URL}/dex/arbitrage", timeout=API_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        return {
-            "market": "dex",
-            "base_token": data.get("base_token"),
-            "amount_in_wei": data.get("amount_in_wei"),
-            "pairs": data.get("pairs", []) or [],
-            "missing_pairs": data.get("missing_pairs", []) or [],
-        }
-    except requests.RequestException as e:
-        logger.error(f"Error fetching DEX arbitrage data from {ARBITRAGE_API_URL}: {e}")
+    data, err = get_json(f"{ARBITRAGE_API_URL}/dex/arbitrage", timeout=API_TIMEOUT)
+    if err or not isinstance(data, dict):
+        logger.error("Error fetching DEX arbitrage data from %s: %s", ARBITRAGE_API_URL, err)
         return {"market": "dex", "pairs": [], "missing_pairs": []}
-    except ValueError as e:
-        logger.error(f"Error parsing DEX JSON from {ARBITRAGE_API_URL}: {e}")
-        return {"market": "dex", "pairs": [], "missing_pairs": []}
-    except ValueError as e:
-        logger.error(f"Error parsing JSON from {ARBITRAGE_API_URL}: {e}")
-        return {"market": market, "opportunities": [], "health": None}
-    except ValueError as e:
-        logger.error(f"Error parsing JSON from {WOI_TRACKED_USERS_API_URL}: {e}")
-        return {"users": []}
+    return {
+        "market": "dex",
+        "base_token": data.get("base_token"),
+        "amount_in_wei": data.get("amount_in_wei"),
+        "pairs": data.get("pairs", []) or [],
+        "missing_pairs": data.get("missing_pairs", []) or [],
+    }
 
 
 if __name__ == "__main__":
     dashboard_data = fetch_dashboard_data()
+    import json
+
     print(json.dumps(dashboard_data, indent=2))

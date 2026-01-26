@@ -3,10 +3,10 @@
 import logging
 from typing import Any, Optional
 
-import requests
 from textual.screen import Screen
 from textual.worker import Worker
 
+from wangr.api import get_json
 from wangr.config import API_TIMEOUT, FETCH_INTERVAL, FRONTPAGE_API_URL
 
 logger = logging.getLogger(__name__)
@@ -89,16 +89,11 @@ class DataFetchingScreen(Screen):
         Returns:
             Dictionary with fetched data, or empty dict on error
         """
-        try:
-            resp = requests.get(self.FETCH_URL, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch data from {self.FETCH_URL}: {e}")
+        data, err = get_json(self.FETCH_URL, timeout=API_TIMEOUT)
+        if err or not isinstance(data, dict):
+            logger.error("Failed to fetch data from %s: %s", self.FETCH_URL, err)
             return {}
-        except ValueError as e:
-            logger.error(f"Failed to parse JSON from {self.FETCH_URL}: {e}")
-            return {}
+        return data
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """

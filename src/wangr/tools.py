@@ -49,6 +49,8 @@ class LocalToolExecutor:
     ) -> str:
         """Read file with line numbers."""
         file_path = self._resolve_path(path)
+        if not self._is_safe_path(file_path):
+            return f"Error: Path outside working directory: {path}"
 
         if not file_path.exists():
             return f"Error: File not found: {path}"
@@ -94,6 +96,8 @@ class LocalToolExecutor:
     ) -> str:
         """Edit file by replacing old_string with new_string."""
         file_path = self._resolve_path(path)
+        if not self._is_safe_path(file_path):
+            return f"Error: Path outside working directory: {path}"
 
         if not file_path.exists():
             return f"Error: File not found: {path}"
@@ -151,6 +155,8 @@ class LocalToolExecutor:
     ) -> str:
         """List files matching glob pattern."""
         search_path = self._resolve_path(path)
+        if not self._is_safe_path(search_path):
+            return f"Error: Path outside working directory: {path}"
 
         if not search_path.exists():
             return f"Error: Directory not found: {path}"

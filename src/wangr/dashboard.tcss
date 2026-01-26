@@ -90,74 +90,6 @@ SentimentInfo Label:first-child {
     color: $error;
 }
 
-/* Whales Screen */
-#whale-coins {
-    height: auto;
-    margin: 1 2;
-    align: center middle;
-}
-
-WhalesScreen #whale-content {
-    border: solid $primary;
-    padding: 1 2;
-    margin: 1 0;
-    height: auto;
-}
-
-.whale-title {
-    text-style: bold;
-    color: $primary;
-    margin: 0 0 1 0;
-}
-
-.whale-bar {
-    color: $success;
-    margin: 0 0 1 0;
-}
-
-.whale-metric {
-    color: $text;
-    margin: 0 0 1 0;
-}
-
-.whale-positions {
-    color: $warning;
-    margin: 1 0 0 0;
-}
-
-/* WOI Screen */
-.woi-container {
-    border: solid $primary;
-    padding: 1 2;
-    margin: 1 0;
-}
-
-.woi-title {
-    text-style: bold;
-    color: $primary;
-    margin: 0 0 1 0;
-}
-
-.woi-summary {
-    color: $accent;
-    margin: 0 0 1 0;
-}
-
-.woi-bar {
-    color: $success;
-    margin: 0 0 1 0;
-}
-
-.woi-stats {
-    color: $text;
-    margin: 0 0 1 0;
-}
-
-.woi-wallets {
-    color: $warning;
-    margin: 1 0 0 0;
-}
-
 /* Liquidations Screen */
 .liq-container {
     border: solid $primary;
@@ -187,39 +119,6 @@ WhalesScreen #whale-content {
 }
 
 .liq-largest {
-    color: $warning;
-    margin: 1 0 0 0;
-}
-
-/* Polymarket Screen */
-.poly-container {
-    border: solid $primary;
-    padding: 1 2;
-    margin: 1 0;
-}
-
-.poly-title {
-    text-style: bold;
-    color: $primary;
-    margin: 0 0 1 0;
-}
-
-.poly-summary {
-    color: $accent;
-    margin: 0 0 1 0;
-}
-
-.poly-stats {
-    color: $text;
-    margin: 0 0 1 0;
-}
-
-.poly-bar {
-    color: $success;
-    margin: 0 0 1 0;
-}
-
-.poly-traders {
     color: $warning;
     margin: 1 0 0 0;
 }
@@ -360,6 +259,12 @@ WhalesScreen #whale-content {
     text-style: bold;
     color: $accent;
     margin: 1 0 0 0;
+}
+
+.whale-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
 }
 
 .whale-bar-stacked {

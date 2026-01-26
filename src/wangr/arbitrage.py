@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-import requests
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
@@ -14,14 +13,17 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, Static
 from textual.worker import Worker
 
+from wangr.api import get_json
 from wangr.config import API_TIMEOUT, ARBITRAGE_API_URL, FETCH_INTERVAL
 from wangr.sort_modal import SortModal
+from wangr.tab_highlight import update_active_tab
+from wangr.table_screen import TableNavigationMixin
 from wangr.utils import safe_float
 
 logger = logging.getLogger(__name__)
 
 
-class ArbitrageScreen(Screen):
+class ArbitrageScreen(TableNavigationMixin, Screen):
     """Screen displaying arbitrage opportunities."""
 
     BINDINGS = [
@@ -41,6 +43,7 @@ class ArbitrageScreen(Screen):
     ]
 
     MARKET_TYPES = ["futures", "spot", "dex"]
+    TABLE_SELECTOR = "#arb-table"
 
     COLUMN_DEFS_BASE = [
         ("symbol", "Symbol"),
@@ -77,8 +80,6 @@ class ArbitrageScreen(Screen):
         self.update_timer = None
         self._arb_worker: Optional[Worker] = None
         self._fetch_token = 0
-        self._pending_g = False
-        self._g_timer = None
 
         cached = self.cache.get(self.market_type)
         if isinstance(cached, dict):
@@ -131,9 +132,7 @@ class ArbitrageScreen(Screen):
             self.update_timer = None
         if self._arb_worker and self._arb_worker.is_running:
             self._arb_worker.cancel()
-        if self._g_timer:
-            self._g_timer.stop()
-            self._g_timer = None
+        self._clear_pending_g()
 
     def on_click(self, event: events.Click) -> None:
         target = event.widget
@@ -184,28 +183,6 @@ class ArbitrageScreen(Screen):
         self.market_type = self.MARKET_TYPES[idx]
 
 
-    def action_cursor_down(self) -> None:
-        self.query_one("#arb-table", DataTable).action_cursor_down()
-
-    def action_cursor_up(self) -> None:
-        self.query_one("#arb-table", DataTable).action_cursor_up()
-
-    def action_page_down(self) -> None:
-        self.query_one("#arb-table", DataTable).action_page_down()
-
-    def action_page_up(self) -> None:
-        self.query_one("#arb-table", DataTable).action_page_up()
-
-    def action_cursor_top(self) -> None:
-        table = self.query_one("#arb-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=0)
-
-    def action_cursor_bottom(self) -> None:
-        table = self.query_one("#arb-table", DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=table.row_count - 1)
-
     def action_sort_by_column(self) -> None:
         self.app.push_screen(
             SortModal(self._column_defs(), self.sort_column, self.sort_reverse),
@@ -229,28 +206,7 @@ class ArbitrageScreen(Screen):
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "g":
-            event.prevent_default()
-            if self._pending_g:
-                self._pending_g = False
-                if self._g_timer:
-                    self._g_timer.stop()
-                    self._g_timer = None
-                self.action_cursor_top()
-            else:
-                self._pending_g = True
-                if self._g_timer:
-                    self._g_timer.stop()
-                self._g_timer = self.set_timer(0.5, self._clear_pending_g)
-        else:
-            self._clear_pending_g()
-
-    def _clear_pending_g(self) -> None:
-        self._pending_g = False
-        if self._g_timer:
-            self._g_timer.stop()
-            self._g_timer = None
+    # Table navigation inherited from TableNavigationMixin.
 
     def _column_defs(self) -> list[tuple[str, str]]:
         cols = list(self.COLUMN_DEFS_BASE)
@@ -290,16 +246,15 @@ class ArbitrageScreen(Screen):
         prefix = "/futures" if market == "futures" else ""
         try:
             if market == "dex":
-                dex_resp = requests.get(f"{ARBITRAGE_API_URL}/dex/arbitrage", timeout=API_TIMEOUT)
-                if not dex_resp.ok:
+                payload, err = get_json(f"{ARBITRAGE_API_URL}/dex/arbitrage", timeout=API_TIMEOUT)
+                if err or not isinstance(payload, dict):
                     return {
                         "market": "dex",
                         "token": token,
-                        "error": "Failed to fetch DEX arbitrage data",
+                        "error": err or "Failed to fetch DEX arbitrage data",
                         "opportunities": [],
                         "health": None,
                     }
-                payload = dex_resp.json()
                 opportunities = self._normalize_dex_pairs(payload.get("pairs", []) or [], payload.get("base_token"))
                 return {
                     "market": "dex",
@@ -308,32 +263,29 @@ class ArbitrageScreen(Screen):
                     "health": None,
                     "error": None,
                 }
-            health_resp = requests.get(f"{ARBITRAGE_API_URL}{prefix}/health", timeout=API_TIMEOUT)
-            top_resp = requests.get(
+            health, err_health = get_json(f"{ARBITRAGE_API_URL}{prefix}/health", timeout=API_TIMEOUT)
+            top, err_top = get_json(
                 f"{ARBITRAGE_API_URL}{prefix}/arbitrage/top",
                 params={"limit": 50, "min_net_pct": -999},
                 timeout=API_TIMEOUT,
             )
-            if not health_resp.ok or not top_resp.ok:
+            if err_health or err_top or not isinstance(top, list):
                 return {
                     "market": market,
                     "token": token,
-                    "error": "Failed to fetch arbitrage data",
+                    "error": err_health or err_top or "Failed to fetch arbitrage data",
                     "opportunities": [],
                     "health": None,
                 }
             return {
                 "market": market,
                 "token": token,
-                "opportunities": top_resp.json(),
-                "health": health_resp.json(),
+                "opportunities": top,
+                "health": health if isinstance(health, dict) else None,
                 "error": None,
             }
-        except requests.RequestException as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error("Arbitrage fetch failed: %s", exc)
-            return {"market": market, "token": token, "error": str(exc), "opportunities": [], "health": None}
-        except ValueError as exc:
-            logger.error("Arbitrage parse failed: %s", exc)
             return {"market": market, "token": token, "error": str(exc), "opportunities": [], "health": None}
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
@@ -358,17 +310,16 @@ class ArbitrageScreen(Screen):
         self._update_table()
 
     def _update_toggle_classes(self) -> None:
-        mapping = {
-            "futures": "#arb-market-futures",
-            "spot": "#arb-market-spot",
-            "dex": "#arb-market-dex",
-        }
-        for key, selector in mapping.items():
-            label = self.query_one(selector, Static)
-            if key == self.market_type:
-                label.add_class("coin-toggle-active")
-            else:
-                label.remove_class("coin-toggle-active")
+        update_active_tab(
+            self,
+            {
+                "futures": "#arb-market-futures",
+                "spot": "#arb-market-spot",
+                "dex": "#arb-market-dex",
+            },
+            self.market_type,
+            active_class="coin-toggle-active",
+        )
 
     def _update_summary(self) -> None:
         rows = self.opportunities

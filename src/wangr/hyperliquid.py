@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 
-import requests
+from wangr.api import post_json
 
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info"
 API_TIMEOUT = 10
@@ -23,14 +23,14 @@ def fetch_prices(coins: list[str] | None = None) -> dict[str, float]:
         Dict mapping coin symbol to price, e.g., {"BTC": 94500.0, "ETH": 3200.0}
     """
     try:
-        resp = requests.post(
+        data, err = post_json(
             HYPERLIQUID_API_URL,
             json={"type": "metaAndAssetCtxs"},
             headers={"Content-Type": "application/json"},
             timeout=API_TIMEOUT,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        if err or not isinstance(data, list):
+            raise ValueError(err or "Unexpected response format")
 
         # Response structure: [{"universe": [{"name": "BTC"}, ...]}, [{markPx: ...}, ...]]
         universe = data[0].get("universe", [])
@@ -52,9 +52,6 @@ def fetch_prices(coins: list[str] | None = None) -> dict[str, float]:
             return {k: v for k, v in prices.items() if k in coins}
         return prices
 
-    except requests.RequestException as e:
-        logger.error(f"Error fetching prices from Hyperliquid: {e}")
-        return {}
     except (ValueError, KeyError, IndexError) as e:
         logger.error(f"Error parsing Hyperliquid response: {e}")
         return {}
@@ -71,14 +68,14 @@ def fetch_asset_context(coin: str) -> Optional[dict]:
         Asset context dict with markPx, funding, openInterest, etc.
     """
     try:
-        resp = requests.post(
+        data, err = post_json(
             HYPERLIQUID_API_URL,
             json={"type": "metaAndAssetCtxs"},
             headers={"Content-Type": "application/json"},
             timeout=API_TIMEOUT,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        if err or not isinstance(data, list):
+            raise ValueError(err or "Unexpected response format")
 
         universe = data[0].get("universe", [])
         asset_ctxs = data[1] if len(data) > 1 else []
@@ -89,7 +86,7 @@ def fetch_asset_context(coin: str) -> Optional[dict]:
 
         return None
 
-    except requests.RequestException as e:
+    except ValueError as e:
         logger.error(f"Error fetching asset context from Hyperliquid: {e}")
         return None
 
@@ -115,16 +112,17 @@ def fetch_funding_history(coin: str, start_time_ms: int, end_time_ms: int | None
         if end_time_ms:
             payload["endTime"] = end_time_ms
 
-        resp = requests.post(
+        data, err = post_json(
             HYPERLIQUID_API_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=API_TIMEOUT,
         )
-        resp.raise_for_status()
-        return resp.json()
+        if err or not isinstance(data, list):
+            raise ValueError(err or "Unexpected response format")
+        return data
 
-    except requests.RequestException as e:
+    except ValueError as e:
         logger.error(f"Error fetching funding history from Hyperliquid: {e}")
         return []
 
@@ -137,20 +135,20 @@ def fetch_all_asset_contexts() -> tuple[list[dict], list[dict]]:
         Tuple of (universe list, asset contexts list)
     """
     try:
-        resp = requests.post(
+        data, err = post_json(
             HYPERLIQUID_API_URL,
             json={"type": "metaAndAssetCtxs"},
             headers={"Content-Type": "application/json"},
             timeout=API_TIMEOUT,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        if err or not isinstance(data, list):
+            raise ValueError(err or "Unexpected response format")
 
         universe = data[0].get("universe", [])
         asset_ctxs = data[1] if len(data) > 1 else []
 
         return universe, asset_ctxs
 
-    except requests.RequestException as e:
+    except ValueError as e:
         logger.error(f"Error fetching asset contexts from Hyperliquid: {e}")
         return [], []

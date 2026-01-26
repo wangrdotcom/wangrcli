@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Optional
 
-import requests
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
@@ -16,6 +15,9 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, Static
 from textual.worker import Worker
 
+from wangr.api import ApiError, get_json, get_json_or_raise
+from wangr.formatters import fmt_num, fmt_pct
+from wangr.tab_highlight import update_active_tab
 from wangr.config import API_TIMEOUT, FETCH_INTERVAL, PMARKETS_BASE_URL
 from wangr.utils import safe_float
 
@@ -174,28 +176,26 @@ class PolymarketFullScreen(Screen):
         self.query_one("#polyfull-mispricings", DataTable).action_cursor_bottom()
 
     def _update_toggle_classes(self) -> None:
-        symbol_ids = {
-            "BTC": "#poly-coin-btc",
-            "ETH": "#poly-coin-eth",
-            "SOL": "#poly-coin-sol",
-        }
-        for symbol, selector in symbol_ids.items():
-            label = self.query_one(selector, Static)
-            if symbol == self.selected_symbol:
-                label.add_class("coin-toggle-active")
-            else:
-                label.remove_class("coin-toggle-active")
-        window_ids = {
-            "30d": "#poly-window-30d",
-            "90d": "#poly-window-90d",
-            "365d": "#poly-window-365d",
-        }
-        for window, selector in window_ids.items():
-            label = self.query_one(selector, Static)
-            if window == self.selected_window:
-                label.add_class("window-toggle-active")
-            else:
-                label.remove_class("window-toggle-active")
+        update_active_tab(
+            self,
+            {
+                "BTC": "#poly-coin-btc",
+                "ETH": "#poly-coin-eth",
+                "SOL": "#poly-coin-sol",
+            },
+            self.selected_symbol,
+            active_class="coin-toggle-active",
+        )
+        update_active_tab(
+            self,
+            {
+                "30d": "#poly-window-30d",
+                "90d": "#poly-window-90d",
+                "365d": "#poly-window-365d",
+            },
+            self.selected_window,
+            active_class="window-toggle-active",
+        )
 
     def _fetch_all_data(self) -> None:
         if self._data_worker and self._data_worker.is_running:
@@ -210,25 +210,24 @@ class PolymarketFullScreen(Screen):
         symbol = self.selected_symbol.lower()
         window = self.selected_window
 
-        def get_json(path: str, params: dict | None = None) -> dict:
+        def get_required(path: str, params: dict | None = None) -> dict:
             url = f"{PMARKETS_BASE_URL}/{path}"
-            resp = requests.get(url, params=params, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json()
+            return get_json_or_raise(url, params=params, timeout=API_TIMEOUT)
 
         def get_optional(path: str, params: dict | None = None) -> Optional[dict]:
-            try:
-                return get_json(path, params)
-            except requests.RequestException:
+            url = f"{PMARKETS_BASE_URL}/{path}"
+            data, err = get_json(url, params=params, timeout=API_TIMEOUT)
+            if err or not isinstance(data, dict):
                 return None
+            return data
 
         try:
             with ThreadPoolExecutor(max_workers=6) as executor:
                 core_futs = {
-                    "strikes": executor.submit(get_json, f"{symbol}/strikes/latest"),
-                    "updown": executor.submit(get_json, f"{symbol}/updown/latest"),
-                    "summary": executor.submit(get_json, f"{symbol}/updown/summary"),
-                    "pivots": executor.submit(get_json, f"{symbol}/strikes/pivot"),
+                    "strikes": executor.submit(get_required, f"{symbol}/strikes/latest"),
+                    "updown": executor.submit(get_required, f"{symbol}/updown/latest"),
+                    "summary": executor.submit(get_required, f"{symbol}/updown/summary"),
+                    "pivots": executor.submit(get_required, f"{symbol}/strikes/pivot"),
                 }
                 strikes = core_futs["strikes"].result()
                 updown = core_futs["updown"].result()
@@ -258,7 +257,7 @@ class PolymarketFullScreen(Screen):
                 compare = get_optional(f"{symbol}/distribution-compare", {"interval": "1d"})
                 if compare:
                     regime_analysis = compare.get("regime_analysis")
-        except requests.RequestException as exc:
+        except ApiError as exc:
             logger.error("Polymarket fetch failed: %s", exc)
             return {"error": str(exc)}
         except Exception as exc:  # noqa: BLE001
@@ -383,7 +382,7 @@ class PolymarketFullScreen(Screen):
             strike = data.get("strike") if isinstance(data, dict) else ""
             prob = data.get("probability") if isinstance(data, dict) else ""
             strike_str = f"{strike:,.0f}" if isinstance(strike, (int, float)) else str(strike)
-            prob_str = f"{safe_float(prob):.1f}%" if isinstance(prob, (int, float)) else str(prob)
+            prob_str = fmt_pct(prob, decimals=1) if isinstance(prob, (int, float)) else str(prob)
             table.add_row(str(name), strike_str, prob_str)
 
     def _update_mispricings_table(self) -> None:
@@ -448,12 +447,12 @@ class PolymarketFullScreen(Screen):
             row = [
                 str(date),
                 f"{safe_float(strike.get('strike_price')):,.0f}",
-                _fmt_pct(strike.get("yes_price")),
-                _fmt_num(strike.get("volume")),
-                _fmt_num(strike.get("liquidity")),
-                _fmt_pct(strike.get("best_bid")),
-                _fmt_pct(strike.get("best_ask")),
-                _fmt_pct(strike.get("spread")),
+                fmt_pct(strike.get("yes_price"), decimals=2),
+                fmt_num(strike.get("volume"), decimals=2),
+                fmt_num(strike.get("liquidity"), decimals=2),
+                fmt_pct(strike.get("best_bid"), decimals=2),
+                fmt_pct(strike.get("best_ask"), decimals=2),
+                fmt_pct(strike.get("spread"), decimals=2),
             ]
             table.add_row(*row)
 
@@ -489,27 +488,6 @@ class PolymarketFullScreen(Screen):
             table.add_row(
                 str(key),
                 str(count),
-                _fmt_pct(avg_up),
+                fmt_pct(avg_up, decimals=2),
                 str(market_count),
             )
-
-
-def _fmt_pct(value: Any) -> str:
-    if value is None:
-        return ""
-    try:
-        return f"{float(value):.2f}%"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _fmt_num(value: Any) -> str:
-    if value is None:
-        return ""
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if abs(num) >= 1000:
-        return f"{num:,.0f}"
-    return f"{num:.2f}"
