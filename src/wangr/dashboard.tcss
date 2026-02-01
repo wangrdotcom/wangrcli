@@ -631,6 +631,7 @@ SentimentInfo Label:first-child {
     height: auto;
     min-height: 9;
     min-width: 32;
+    max-width: 100%;
     transition: border 200ms;
 }
 
@@ -649,6 +650,7 @@ SentimentInfo Label:first-child {
     margin: 0 0 1 0;
     text-wrap: wrap;
     min-height: 3;
+    overflow: hidden;
 }
 
 .dashboard-card-action {
@@ -718,6 +720,34 @@ SortModal {
     color: $accent;
     margin: 0;
     display: none;
+}
+
+/* Polymarket Agent Screen */
+#polymarket-container {
+    height: 100%;
+    width: 100%;
+    padding: 0;
+}
+
+#polymarket-log {
+    height: 1fr;
+    width: 100%;
+    border: none;
+    padding: 0;
+    margin: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+    scrollbar-background: $panel;
+    scrollbar-color: $primary;
+}
+
+#polymarket-input {
+    height: 3;
+    width: 100%;
+    border: solid $panel;
+    padding: 0 1;
+    margin: 0;
 }
 
 /* Loading Spinner Widget */
