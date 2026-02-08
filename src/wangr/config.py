@@ -14,6 +14,7 @@ KEYS_VALIDATE_URL: Final[str] = "https://cliagent.wangr.com/keys/validate"
 WOI_TRACKED_USERS_API_URL: Final[str] = "https://api2899.wangr.com/woi/tracked-users?limit=400"
 POLYMARKET_WHALES_API_URL: Final[str] = "https://polymarket-api.wangr.com/whales"
 POLYMARKET_TRADER_API_URL: Final[str] = "https://polymarket-api.wangr.com/trader"
+POLYMARKET_META_API_URL: Final[str] = "https://cliagent.wangr.com/api/polymarket"
 ARBITRAGE_API_URL: Final[str] = "https://arbitrage.wangr.com"
 
 # Timeouts

@@ -1,27 +1,22 @@
-"""Chat screen for Wangr agent."""
+"""Chat screen for Wangr agent with streaming responses."""
 
-import difflib
-from pathlib import Path
 from typing import Any
 
-import requests
-from agents import apply_diff as agents_apply_diff
-from rich.console import Group
-from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, RichLog
-from textual.worker import Worker
 
-from wangr.config import API_TIMEOUT, CHAT_API_URL
-from wangr.settings import get_api_key
-from wangr.tools import LocalToolExecutor
+from wangr.config import CHAT_API_URL
+from wangr.context_store import prepend_context_to_message
+from wangr.entity_metadata import enrich_entities_in_background
+from wangr.file_ops_mixin import FileOpsMixin
+from wangr.stream_handler import iter_ndjson_events, should_suppress_status, stream_post
 
 
-class ChatScreen(Screen):
-    """Interactive chat screen."""
+class ChatScreen(FileOpsMixin, Screen):
+    """Streaming chat screen for general crypto queries."""
 
     BINDINGS = [
         ("b", "go_back", "Go Back"),
@@ -33,30 +28,40 @@ class ChatScreen(Screen):
         super().__init__()
         self._history: list[dict[str, Any]] = []
         self._entries: list[dict[str, Any]] = []
-        self._worker: Worker | None = None
+        self._streaming = False
+        self._current_text = ""
+        self._current_tool: str | None = None
+        self._entities: dict[str, list[dict[str, Any]]] = {}
         self._processing_timer = None
         self._processing_frame = 0
-        self._pending_index: int | None = None
-        self._tool_executor = LocalToolExecutor(working_directory=str(Path.cwd()))
+        # File operations state (required by FileOpsMixin)
         self._pending_file_ops: dict[str, Any] | None = None
-        self._auto_approve_chain = False
         self._pending_requires_approval = False
+        self._auto_approve_chain = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
         yield Container(
             RichLog(id="chat-log", wrap=True, highlight=True, markup=True),
-            Input(placeholder="Ask Wangr…", id="chat-input"),
+            Input(placeholder="Ask Wangr\u2026", id="chat-input"),
             id="chat-container",
         )
 
     async def on_mount(self) -> None:
         self._restore_state()
         if not self._entries:
-            self._entries.append({"role": "system", "content": "[bold]💬 Wangr Crypto Assistant[/bold]"})
             self._entries.append(
-                {"role": "system", "content": "Ask about whales, markets, or wallets. [dim](Ctrl+L to clear)[/dim]\n"}
+                {
+                    "role": "system",
+                    "content": "[bold]\U0001f4ac Wangr Crypto Assistant[/bold]",
+                }
+            )
+            self._entries.append(
+                {
+                    "role": "system",
+                    "content": "Ask about whales, markets, or wallets. [dim](Ctrl+L to clear)[/dim]\n",
+                }
             )
         self._render_entries()
         self.query_one("#chat-input", Input).focus()
@@ -67,18 +72,30 @@ class ChatScreen(Screen):
     def action_clear_chat(self) -> None:
         self._history = []
         self._entries = [
-            {"role": "system", "content": "[bold]💬 Wangr Crypto Assistant[/bold]"},
-            {"role": "system", "content": "✓ History cleared.\n"},
+            {
+                "role": "system",
+                "content": "[bold]\U0001f4ac Wangr Crypto Assistant[/bold]",
+            },
+            {"role": "system", "content": "\u2713 History cleared.\n"},
         ]
+        self._entities = {}
+        self._pending_file_ops = None
+        self._pending_requires_approval = False
+        self._auto_approve_chain = False
         self._render_entries()
         self._persist_state()
+
+    # ------------------------------------------------------------------
+    # Input handling
+    # ------------------------------------------------------------------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         message = event.value.strip()
         if not message:
             return
-        if self._worker and self._worker.is_running:
+        if self._streaming:
             return
+        # Handle Y/N for pending file ops
         if self._pending_file_ops and self._pending_requires_approval:
             normalized = message.lower()
             if normalized not in {"y", "n"}:
@@ -88,7 +105,7 @@ class ChatScreen(Screen):
             self._append_user_message(message)
             event.input.disabled = True
             self._start_processing()
-            self._worker = self.run_worker(
+            self.run_worker(
                 lambda: self._resolve_pending_request(decision),
                 thread=True,
                 name="chat_pending",
@@ -97,176 +114,13 @@ class ChatScreen(Screen):
         event.input.value = ""
         self._append_user_message(message)
         event.input.disabled = True
-        self._start_processing()
-        self._worker = self.run_worker(
-            lambda: self._chat_request(message),
-            thread=True,
-            name="chat_request",
-        )
-
-    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        if event.worker != self._worker:
-            return
-        input_box = self.query_one("#chat-input", Input)
-        if event.state.name == "SUCCESS":
-            self._stop_processing()
-            response, tool_calls = event.worker.result
-            # Check for pending marker - prepare prompt on main thread
-            if response == "__PENDING__" and self._pending_file_ops:
-                prompt = self._prepare_pending_prompt(self._pending_file_ops)
-                if prompt:
-                    self._append_assistant_message(prompt, [])
-                input_box.disabled = True
-                self.focus()
-            elif self._pending_file_ops:
-                self._append_assistant_message(response, tool_calls)
-                input_box.disabled = True
-                self.focus()
-            else:
-                self._append_assistant_message(response, tool_calls)
-                input_box.disabled = False
-                input_box.focus()
-        elif event.state.name == "ERROR":
-            input_box.disabled = False
-            input_box.focus()
-            self._stop_processing()
-            self._append_system_message("Request failed.")
-
-    def _chat_request(self, message: str) -> tuple[str, list[dict[str, Any]]]:
-        return self._real_chat_request(message)
-
-    def _real_chat_request(self, message: str) -> tuple[str, list[dict[str, Any]]]:
-        """Real API request with local apply_patch handling."""
-        try:
-            data = self._post_chat({"message": message, "history": self._history})
-            reply = data.get("response", "")
-            tool_calls = data.get("tool_calls", []) or []
-            response_id = data.get("response_id")
-            pending = data.get("pending_file_ops")
-            if pending:
-                self._pending_file_ops = pending
-                self._auto_approve_chain = False
-                # Check if approval is needed without updating UI from worker thread
-                _preview, approvable, _auto_outputs = self._categorize_patch_ops(pending)
-                self._pending_requires_approval = bool(approvable)
-                if self._pending_requires_approval:
-                    # Return marker - main thread will prepare the prompt
-                    return "__PENDING__", []
-                reply, _ = self._resolve_pending_request(True)
-                self._history.append({"role": "user", "content": message})
-                self._history.append({"role": "assistant", "content": reply})
-                self._persist_state()
-                return reply, []
-            if tool_calls:
-                followup_reply, tool_calls = self._process_tool_calls(tool_calls, response_id)
-                if followup_reply:
-                    reply = followup_reply
-            self._history.append({"role": "user", "content": message})
-            self._history.append({"role": "assistant", "content": reply})
-            self._persist_state()
-            return reply, tool_calls
-        except Exception as exc:
-            raise RuntimeError("chat request failed") from exc
-
-    def _post_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        headers = {}
-        api_key = get_api_key()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        response = requests.post(
-            CHAT_API_URL,
-            json=payload,
-            headers=headers,
-            timeout=API_TIMEOUT * 12,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def _post_chat_continue(self, payload: dict[str, Any]) -> dict[str, Any]:
-        headers = {}
-        api_key = get_api_key()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        response = requests.post(
-            f"{CHAT_API_URL}/continue",
-            json=payload,
-            headers=headers,
-            timeout=API_TIMEOUT * 12,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def _resolve_pending_request(self, approved: bool) -> tuple[str, list[dict[str, Any]]]:
-        pending = self._pending_file_ops
-        if not pending:
-            return "No pending operations.", []
-        if approved and self._auto_approve_chain:
-            response = ""
-            remaining = pending
-            for i in range(20):
-                response, next_pending, _auto_approved = self._resolve_pending(
-                    remaining, True, True
-                )
-                if not next_pending:
-                    remaining = None
-                    break
-                remaining = next_pending
-            self._pending_file_ops = remaining
-            self._auto_approve_chain = True
-            self._pending_requires_approval = False
-            return response, []
-        response, next_pending, auto_approved = self._resolve_pending(
-            pending, approved, self._auto_approve_chain
-        )
-        self._pending_file_ops = next_pending
-        self._auto_approve_chain = auto_approved
-        if self._pending_file_ops:
-            # Return marker to signal main thread should prepare pending prompt
-            # Don't call _prepare_pending_prompt here as it updates UI from worker thread
-            return "__PENDING__", []
-        self._pending_requires_approval = False
-        return response, []
-
-    def _prepare_pending_prompt(self, pending: dict[str, Any]) -> str:
-        preview, approvable, _auto_outputs = self._categorize_patch_ops(pending)
-        self._pending_requires_approval = bool(approvable)
-        if preview:
-            renderable = Group(
-                Text("Proposed changes:", style="bold"),
-                self._render_diff(preview),
-            )
-            self._append_assistant_renderable(renderable, [])
-        elif approvable:
-            self._append_assistant_message("[dim]Proposed changes (no diff preview available).[/dim]", [])
-        if approvable:
-            return "Apply these changes? [bold]Y[/bold]/[bold]N[/bold]"
-        return ""
-
-    def _render_diff(self, preview: str) -> Group:
-        """Render a diff without background, using theme-matching colors."""
-        lines = preview.splitlines()
-        width = len(str(len(lines))) if lines else 1
-        rendered = []
-        for idx, line in enumerate(lines, start=1):
-            text = Text()
-            text.append(f"{idx:>{width}} ", style="dim")
-            if line.startswith("+++") or line.startswith("---"):
-                text.append(line, style="dim")
-            elif line.startswith("@@"):
-                text.append(line, style="cyan")
-            elif line.startswith("+"):
-                text.append(line, style="green")
-            elif line.startswith("-"):
-                text.append(line, style="red")
-            else:
-                text.append(line, style="white")
-            rendered.append(text)
-        return Group(*rendered)
+        self._start_streaming(message)
 
     def on_key(self, event: events.Key) -> None:
+        """Handle Y/N key press for file operation approval."""
         if not self._pending_file_ops or not self._pending_requires_approval:
             return
-        if self._worker and self._worker.is_running:
+        if self._streaming:
             return
         key = event.key.lower()
         if key not in {"y", "n"}:
@@ -277,405 +131,410 @@ class ChatScreen(Screen):
         input_box.value = ""
         input_box.disabled = True
         self._start_processing()
-        self._worker = self.run_worker(
+        self.run_worker(
             lambda: self._resolve_pending_request(approved),
             thread=True,
             name="chat_pending",
         )
 
-    def _resolve_pending(
-        self, pending: dict[str, Any], approved: bool, auto_approve_chain: bool
-    ) -> tuple[str, dict[str, Any] | None, bool]:
-        pending_id = pending.get("id")
-        operations = pending.get("operations", [])
-        if not pending_id:
-            raise ValueError("Missing pending operation id from server response.")
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
 
-        read_ops = [op for op in operations if op.get("type") == "read_file"]
-        patch_ops = [op for op in operations if op.get("type") == "apply_patch"]
-
-        outputs = []
-        auto_outputs = []
-
-        if read_ops:
-            outputs.extend(self._execute_read_ops(read_ops))
-
-        if patch_ops:
-            _preview, approvable, auto_outputs = self._categorize_patch_ops(pending)
-            outputs.extend(auto_outputs)
-
-            if approvable:
-                if approved or auto_approve_chain:
-                    outputs.extend(self._apply_patch_ops(approvable))
-                else:
-                    outputs.extend(self._deny_operations(approvable, "User denied apply_patch operation."))
-
-        data = self._post_chat_continue(
-            {"pending_id": pending_id, "tool_outputs": outputs}
+    def _start_streaming(self, message: str) -> None:
+        """Start streaming request in a worker thread."""
+        self._streaming = True
+        self._current_text = ""
+        self._current_tool = None
+        self._entities = {}
+        self._start_processing()
+        self.run_worker(
+            lambda: self._stream_request(message),
+            thread=True,
+            name="chat_stream",
         )
-        response = data.get("response", "")
-        next_pending = data.get("pending_file_ops")
-        return response, next_pending, auto_approve_chain or (approved and bool(patch_ops) and not auto_outputs)
 
-    def _execute_read_ops(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        results = []
-        base_dir = Path.cwd()
-        for op in operations:
-            call_id = op.get("call_id")
-            path = op.get("path", "")
-            try:
-                content = self._read_local_file(path, base_dir)
-                results.append({
-                    "call_id": call_id,
-                    "status": "completed",
-                    "output": content,
-                })
-            except Exception as exc:
-                results.append({
-                    "call_id": call_id,
-                    "status": "failed",
-                    "output": f"Error reading file: {exc}",
-                })
-        return results
+    def _stream_request(self, message: str) -> tuple[str, list[dict[str, Any]]]:
+        """Execute streaming request and process events."""
+        try:
+            enriched_message = prepend_context_to_message(message)
+            response = stream_post(
+                CHAT_API_URL,
+                {"message": enriched_message, "history": self._history},
+            )
 
-    def _categorize_patch_ops(
-        self, pending: dict[str, Any]
-    ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
-        previews = []
-        approvable = []
-        auto_outputs = []
-        base_dir = Path.cwd()
+            full_text, tool_calls = self._process_stream_response(response)
 
-        for op in pending.get("operations", []):
-            if op.get("type") != "apply_patch":
-                continue
-            call_id = op.get("call_id")
-            operation = op.get("operation", op)
-            op_type = operation.get("type")
-            try:
-                diff = self._preview_operation(operation, base_dir)
-                if diff:
-                    previews.append(diff)
-                if op_type in {"create_file", "update_file", "delete_file"}:
-                    approvable.append(op)
-            except Exception as exc:
-                path = operation.get("path", "<unknown>")
-                auto_outputs.append({
-                    "call_id": call_id,
-                    "status": "failed",
-                    "output": f"Preview error for {path}: {exc}",
-                })
+            # Store original message (without context prefix) in history
+            self._history.append({"role": "user", "content": message})
+            self._history.append({"role": "assistant", "content": full_text})
 
-        return "\n\n".join(previews), approvable, auto_outputs
+            return full_text, tool_calls
 
-    def _apply_patch_ops(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        results = []
-        base_dir = Path.cwd()
-        for op in operations:
-            call_id = op.get("call_id")
-            operation = op.get("operation", op)
-            success, output = self._apply_operation(operation, base_dir)
-            results.append({
-                "call_id": call_id,
-                "status": "completed" if success else "failed",
-                "output": output,
-            })
-        return results
+        except Exception as exc:
+            self.app.call_from_thread(self._handle_error, str(exc))
+            raise RuntimeError("stream request failed") from exc
 
-    def _deny_operations(self, operations: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
-        return [{
-            "call_id": op.get("call_id"),
-            "status": "failed",
-            "output": reason,
-        } for op in operations]
+    def _process_stream_response(
+        self, response
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Process streaming response and return full text and tool calls."""
+        full_text = ""
+        tool_calls: list[dict[str, Any]] = []
 
-    def _sanitize_diff(self, diff: str) -> str:
-        lines = []
-        for line in diff.splitlines():
-            if line.startswith("*** Begin Patch") or line.startswith("*** End Patch"):
-                continue
-            if line.startswith("*** Update File") or line.startswith("*** Add File") or line.startswith("*** Delete File"):
-                continue
-            if line.startswith("diff --git") or line.startswith("index "):
-                continue
-            if line.startswith("--- ") or line.startswith("+++ "):
-                continue
-            lines.append(line)
-        return "\n".join(lines)
+        for event in iter_ndjson_events(response):
+            # Check for pending_file_ops event
+            if event.get("type") == "pending_file_ops":
+                self.app.call_from_thread(self._handle_pending_file_ops, event)
+                return full_text, tool_calls
 
-    def _apply_diff(self, input_text: str, diff: str, mode: str = "default") -> str:
-        return agents_apply_diff(input_text, self._sanitize_diff(diff), mode)
+            self._process_stream_event(event)
 
-    def _normalize_operation(self, operation: dict[str, Any]) -> dict[str, Any]:
-        if "operation" in operation and isinstance(operation["operation"], dict):
-            operation = operation["operation"]
-        op_type = operation.get("type")
-        path = operation.get("path")
-        if not op_type or not path:
-            raise ValueError("Operation must include 'type' and 'path'.")
-        return {"type": op_type, "path": path, "diff": operation.get("diff")}
+            if event.get("type") == "text_delta":
+                full_text += event.get("content", "")
+            elif event.get("type") == "text":
+                full_text = event.get("content", "")
+            elif event.get("type") == "done":
+                tool_calls = event.get("tool_calls", [])
 
-    def _resolve_path(self, base_dir: Path, path: str) -> Path:
-        candidate = Path(path)
-        if candidate.is_absolute():
-            raise ValueError("Absolute paths are not allowed.")
-        resolved = (base_dir / candidate).resolve()
-        if not resolved.is_relative_to(base_dir.resolve()):
-            raise ValueError("Path escapes the workspace root.")
-        return resolved
+        return full_text, tool_calls
 
-    def _preview_operation(self, operation: dict[str, Any], base_dir: Path) -> str:
-        op = self._normalize_operation(operation)
-        target = self._resolve_path(base_dir, op["path"])
-        if op["type"] == "delete_file":
-            if not target.exists():
-                raise ValueError(f"File not found: {op['path']}")
-            old_content = target.read_text()
-            new_content = ""
-        elif op["type"] == "create_file":
-            if target.exists():
-                raise ValueError(f"File already exists: {op['path']}")
-            old_content = ""
-            new_content = self._apply_diff("", op.get("diff") or "", mode="create")
-        elif op["type"] == "update_file":
-            if not target.exists():
-                raise ValueError(f"File not found: {op['path']}")
-            old_content = target.read_text()
-            new_content = self._apply_diff(old_content, op.get("diff") or "")
-        else:
-            raise ValueError(f"Unsupported operation type: {op['type']}")
+    def _process_stream_event(self, event: dict[str, Any]) -> None:
+        """Process a single stream event (called from worker thread)."""
+        event_type = event.get("type")
 
-        if old_content == new_content:
+        if event_type == "status":
+            msg = event.get("message", "")
+            if not should_suppress_status(msg):
+                self.app.call_from_thread(self._update_status, msg)
+
+        elif event_type == "tool_start":
+            self.app.call_from_thread(self._show_tool_start, event.get("name", "Tool"))
+
+        elif event_type == "tool_end":
+            self.app.call_from_thread(
+                self._show_tool_end,
+                event.get("name", "Tool"),
+                event.get("duration", 0),
+                event.get("entities", {}),
+            )
+
+        elif event_type == "text_start":
+            self.app.call_from_thread(self._start_text_display)
+
+        elif event_type == "text_delta":
+            self.app.call_from_thread(
+                self._append_text_delta, event.get("content", "")
+            )
+
+        elif event_type == "text_end":
+            self.app.call_from_thread(self._finish_text_display)
+
+        elif event_type == "done":
+            self.app.call_from_thread(self._finish_streaming, event.get("duration", 0))
+
+        elif event_type == "error":
+            self.app.call_from_thread(
+                self._handle_error, event.get("message", "Unknown error")
+            )
+
+    # ------------------------------------------------------------------
+    # File ops (using FileOpsMixin)
+    # ------------------------------------------------------------------
+
+    def _handle_pending_file_ops(self, event: dict[str, Any]) -> None:
+        """Handle pending file operations event."""
+        self._pending_file_ops = {
+            "id": event.get("id"),
+            "operations": event.get("operations", []),
+        }
+        self._streaming = False
+        self._stop_processing()
+        self._remove_processing_placeholder()
+
+        prompt = self._prepare_pending_prompt(self._pending_file_ops)
+        if prompt:
+            self._entries.append({"role": "assistant", "content": prompt})
+            self._render_entries()
+
+        input_box = self.query_one("#chat-input", Input)
+        input_box.disabled = False
+        input_box.focus()
+
+    def _resolve_pending_request(
+        self, approved: bool
+    ) -> tuple[str, list[dict[str, Any]]]:
+        pending = self._pending_file_ops
+        if not pending:
+            return "No pending operations.", []
+
+        response, next_pending, new_auto = self._resolve_pending_core(
+            pending, approved, self._auto_approve_chain, self._stream_continue_request
+        )
+
+        self._pending_file_ops = next_pending
+        self._auto_approve_chain = new_auto
+        if not next_pending:
+            self._pending_requires_approval = False
+            self._auto_approve_chain = False
+
+        return response, []
+
+    def _stream_continue_request(
+        self, pending_id: str, tool_outputs: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Stream the continue request response."""
+        response = stream_post(
+            f"{CHAT_API_URL}/continue",
+            {"pending_id": pending_id, "tool_outputs": tool_outputs},
+        )
+
+        full_text = ""
+        next_pending = None
+
+        for event in iter_ndjson_events(response):
+            if event.get("type") == "pending_file_ops":
+                next_pending = {
+                    "id": event.get("id"),
+                    "operations": event.get("operations", []),
+                }
+                self.app.call_from_thread(self._handle_pending_file_ops, event)
+                return full_text, next_pending
+
+            self._process_stream_event(event)
+
+            if event.get("type") == "text_delta":
+                full_text += event.get("content", "")
+
+        return full_text, None
+
+    # ------------------------------------------------------------------
+    # UI callbacks
+    # ------------------------------------------------------------------
+
+    def _update_status(self, message: str) -> None:
+        if self._entries and self._entries[-1].get("role") == "pending":
+            self._entries[-1]["content"] = f"{self._processing_text()} {message}"
+            self._render_entries()
+
+    def _show_tool_start(self, tool_name: str) -> None:
+        self._current_tool = tool_name
+        display_name = self._format_tool_name(tool_name)
+        if self._entries and self._entries[-1].get("role") == "pending":
+            self._entries[-1]["content"] = (
+                f"{self._processing_text()} [cyan]{display_name}...[/cyan]"
+            )
+            self._render_entries()
+
+    def _show_tool_end(
+        self, tool_name: str, duration: float, entities: dict[str, Any]
+    ) -> None:
+        self._current_tool = None
+
+        # Merge entities (all 5 types)
+        for key in ["markets", "events", "users", "symbols", "tokens"]:
+            if key in entities and entities[key]:
+                if key not in self._entities:
+                    self._entities[key] = []
+                self._entities[key].extend(entities[key])
+
+        # Launch background metadata enrichment for polymarket entities
+        if any(entities.get(k) for k in ["markets", "events", "users"]):
+            self.run_worker(
+                lambda: enrich_entities_in_background(
+                    entities, self._on_entity_enriched
+                ),
+                thread=True,
+                name="chat_enrich",
+            )
+
+        display_name = self._format_tool_name(tool_name)
+        if self._entries and self._entries[-1].get("role") == "pending":
+            self._entries[-1]["content"] = (
+                f"{self._processing_text()} [green]{display_name}[/green] [dim]({duration:.1f}s)[/dim]"
+            )
+            self._render_entries()
+
+    def _on_entity_enriched(
+        self, entity_type: str, key: str, metadata: dict[str, Any]
+    ) -> None:
+        """Callback from metadata enrichment worker."""
+        entities = self._entities.get(entity_type, [])
+        for e in entities:
+            entity_key = e.get("slug") or e.get("wallet") or e.get("id")
+            if entity_key == key:
+                e.update(metadata)
+
+    def _format_tool_name(self, tool_name: str) -> str:
+        name_map = {
+            "get_whale_trades": "Loading whale trades",
+            "get_whale_positions": "Loading whale positions",
+            "get_liquidations": "Loading liquidations",
+            "get_market_data": "Loading market data",
+            "get_token_price": "Loading price",
+            "get_wallet_info": "Loading wallet",
+            "search_whales": "Searching whales",
+            "web_search": "Searching web",
+            "apply_patch": "Applying changes",
+            "read_file": "Reading file",
+        }
+        return name_map.get(tool_name, tool_name.replace("_", " ").title())
+
+    def _start_text_display(self) -> None:
+        self._stop_processing()
+        self._current_text = ""
+        if self._entries and self._entries[-1].get("role") == "pending":
+            self._entries.pop()
+
+        if self._entities:
+            self._append_entities_display()
+
+        self._entries.append({"role": "assistant_streaming", "content": ""})
+        self._render_entries()
+
+    def _append_text_delta(self, content: str) -> None:
+        self._current_text += content
+        if self._entries and self._entries[-1].get("role") == "assistant_streaming":
+            self._entries[-1]["content"] = self._current_text
+            self._render_entries()
+
+    def _finish_text_display(self) -> None:
+        if self._entries and self._entries[-1].get("role") == "assistant_streaming":
+            self._entries[-1]["role"] = "assistant"
+            self._render_entries()
+
+    def _finish_streaming(self, duration: float) -> None:
+        self._streaming = False
+        self._stop_processing()
+        self._persist_state()
+
+        input_box = self.query_one("#chat-input", Input)
+        input_box.disabled = False
+        input_box.focus()
+
+    def _handle_error(self, message: str) -> None:
+        self._streaming = False
+        self._stop_processing()
+        self._remove_processing_placeholder()
+        self._append_system_message(f"Error: {message}")
+
+        input_box = self.query_one("#chat-input", Input)
+        input_box.disabled = False
+        input_box.focus()
+
+    def on_worker_state_changed(self, event) -> None:
+        if event.worker.name not in ("chat_stream", "chat_pending", "chat_enrich"):
+            return
+
+        if event.state.name == "ERROR" and event.worker.name != "chat_enrich":
+            self._streaming = False
+            self._stop_processing()
+            input_box = self.query_one("#chat-input", Input)
+            input_box.disabled = False
+            input_box.focus()
+
+    # ------------------------------------------------------------------
+    # Entity display
+    # ------------------------------------------------------------------
+
+    def _append_entities_display(self) -> None:
+        for entity_type in ["markets", "events", "users", "symbols", "tokens"]:
+            entities = self._entities.get(entity_type, [])
+            if entities:
+                seen: set[str] = set()
+                unique: list[dict[str, Any]] = []
+                for e in entities:
+                    key = (
+                        e.get("id")
+                        or e.get("slug")
+                        or e.get("wallet")
+                        or e.get("symbol")
+                        or str(e)
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(e)
+
+                card_content = self._format_entity_card(entity_type, unique)
+                self._entries.append({"role": "entity", "content": card_content})
+
+    def _format_entity_card(
+        self, entity_type: str, entities: list[dict[str, Any]]
+    ) -> str:
+        if not entities:
             return ""
 
-        old_lines = old_content.splitlines()
-        new_lines = new_content.splitlines()
-        to_name = op["path"] if op["type"] != "delete_file" else "(deleted)"
-        diff_lines = difflib.unified_diff(
-            old_lines,
-            new_lines,
-            fromfile=op["path"],
-            tofile=to_name,
-            lineterm="",
-        )
-        return "\n".join(diff_lines)
+        lines: list[str] = []
+        icon = {
+            "markets": "\U0001f4ca",
+            "events": "\U0001f4c5",
+            "users": "\U0001f464",
+            "symbols": "\U0001f4c8",
+            "tokens": "\U0001fa99",
+        }.get(entity_type, "\u2022")
+        title = entity_type.title()
+        lines.append(f"[bold cyan]{icon} {title} Found[/bold cyan]")
 
-    def _apply_operation(self, operation: dict[str, Any], base_dir: Path) -> tuple[bool, str]:
-        try:
-            op = self._normalize_operation(operation)
-            target = self._resolve_path(base_dir, op["path"])
-            if op["type"] == "delete_file":
-                if not target.exists():
-                    return False, f"File not found: {op['path']}"
-                target.unlink()
-                return True, f"Deleted {op['path']}"
-            if op["type"] == "create_file":
-                if target.exists():
-                    return False, f"File already exists: {op['path']}"
-                content = self._apply_diff("", op.get("diff") or "", mode="create")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content)
-                return True, f"Created {op['path']}"
-            if op["type"] == "update_file":
-                if not target.exists():
-                    return False, f"File not found: {op['path']}"
-                old_content = target.read_text()
-                new_content = self._apply_diff(old_content, op.get("diff") or "")
-                if new_content != old_content:
-                    target.write_text(new_content)
-                return True, f"Updated {op['path']}"
-            return False, f"Unsupported operation type: {op['type']}"
-        except Exception as exc:
-            return False, str(exc)
+        for entity in entities[:5]:
+            if entity_type == "markets":
+                question = entity.get("question", entity.get("slug", "Unknown"))
+                if len(question) > 60:
+                    question = question[:57] + "..."
+                lines.append(f"  [dim]\u2022[/dim] {question}")
+            elif entity_type == "events":
+                title_text = entity.get("title", entity.get("slug", "Unknown"))
+                if len(title_text) > 60:
+                    title_text = title_text[:57] + "..."
+                lines.append(f"  [dim]\u2022[/dim] {title_text}")
+            elif entity_type == "users":
+                username = entity.get("username") or entity.get("wallet", "")[:16]
+                pnl = entity.get("pnl")
+                if pnl is not None:
+                    pnl_color = "green" if pnl >= 0 else "red"
+                    lines.append(
+                        f"  [dim]\u2022[/dim] {username} [{pnl_color}]${pnl:,.0f}[/{pnl_color}]"
+                    )
+                else:
+                    lines.append(f"  [dim]\u2022[/dim] {username}")
+            elif entity_type == "symbols":
+                symbol = entity.get("symbol", "?")
+                price = entity.get("price")
+                change = entity.get("change_24h_pct")
+                price_str = f"${price:,.2f}" if price is not None else ""
+                change_str = ""
+                if change is not None:
+                    color = "green" if change >= 0 else "red"
+                    change_str = f" [{color}]{change:+.1f}%[/{color}]"
+                lines.append(f"  [dim]\u2022[/dim] {symbol} {price_str}{change_str}")
+            elif entity_type == "tokens":
+                symbol = entity.get("symbol", "?")
+                name = entity.get("name", symbol)
+                price = entity.get("price")
+                price_str = f" ${price:,.4f}" if price is not None else ""
+                lines.append(f"  [dim]\u2022[/dim] {name} ({symbol}){price_str}")
 
-    def _read_local_file(self, path: str, base_dir: Path) -> str:
-        resolved = self._resolve_path(base_dir, path)
-        return resolved.read_text()
+        if len(entities) > 5:
+            lines.append(f"  [dim]... +{len(entities) - 5} more[/dim]")
 
-    def _process_tool_calls(
-        self,
-        tool_calls: list[dict[str, Any]],
-        response_id: str | None,
-        max_rounds: int = 5,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        reply = ""
-        all_calls: list[dict[str, Any]] = []
-        current_calls = tool_calls
-        current_response_id = response_id
+        return "\n".join(lines)
 
-        for _ in range(max_rounds):
-            outputs, decorated_calls = self._handle_tool_calls(current_calls)
-            all_calls.extend(decorated_calls)
-            if not outputs:
-                break
-            payload: dict[str, Any] = {"history": self._history, "tool_outputs": outputs}
-            if current_response_id:
-                payload["previous_response_id"] = current_response_id
-            data = self._post_chat(payload)
-            reply = data.get("response", "")
-            current_calls = data.get("tool_calls", []) or []
-            current_response_id = data.get("response_id", current_response_id)
-            if not current_calls:
-                break
-
-        return reply, all_calls
-
-    def _handle_tool_calls(
-        self, tool_calls: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        outputs: list[dict[str, Any]] = []
-        decorated_calls: list[dict[str, Any]] = []
-
-        for call in tool_calls:
-            operations, call_id = self._extract_apply_patch_operations(call)
-            if operations:
-                results = []
-                for operation in operations:
-                    ok, message = self._tool_executor.apply_patch_operation(operation)
-                    results.append((ok, message))
-                status = "completed" if all(ok for ok, _ in results) else "failed"
-                message = "\n".join(msg for _, msg in results)
-                tool_name = "apply_patch"
-            else:
-                status = "failed"
-                message = "Error: Unsupported tool call"
-                tool_name = call.get("name", "tool")
-
-            if call_id:
-                outputs.append(
-                    {
-                        "type": "apply_patch_call_output",
-                        "call_id": call_id,
-                        "status": status,
-                        "output": message,
-                    }
-                )
-
-            decorated = dict(call)
-            decorated["name"] = tool_name
-            decorated["status"] = status
-            decorated["result"] = message
-            decorated_calls.append(decorated)
-
-        return outputs, decorated_calls
-
-    @staticmethod
-    def _extract_apply_patch_operations(
-        call: dict[str, Any]
-    ) -> tuple[list[dict[str, Any]] | None, str | None]:
-        call_id = call.get("call_id") or call.get("id")
-        if call.get("type") == "apply_patch_call":
-            operation = call.get("operation")
-            if operation:
-                return [operation], call_id
-
-        if call.get("name") == "apply_patch":
-            operation = call.get("operation")
-            if operation:
-                return [operation], call_id
-            arguments = call.get("arguments") or call.get("args") or {}
-            patch = arguments.get("patch") if isinstance(arguments, dict) else None
-            if patch:
-                return ChatScreen._parse_begin_patch(patch), call_id
-
-        return None, call_id
-
-    @staticmethod
-    def _parse_begin_patch(patch: str) -> list[dict[str, Any]]:
-        operations: list[dict[str, Any]] = []
-        lines = patch.splitlines()
-        idx = 0
-        while idx < len(lines):
-            line = lines[idx]
-            if line.startswith("*** Add File: "):
-                path = line.replace("*** Add File: ", "", 1).strip()
-                idx += 1
-                content_lines = []
-                while idx < len(lines) and not lines[idx].startswith("*** "):
-                    if lines[idx].startswith("+"):
-                        content_lines.append(lines[idx][1:])
-                    idx += 1
-                operations.append(
-                    {"type": "create_file", "path": path, "diff": "\n".join(content_lines)}
-                )
-                continue
-            if line.startswith("*** Update File: "):
-                path = line.replace("*** Update File: ", "", 1).strip()
-                idx += 1
-                diff_lines = []
-                while idx < len(lines) and not lines[idx].startswith("*** "):
-                    diff_lines.append(lines[idx])
-                    idx += 1
-                operations.append(
-                    {"type": "update_file", "path": path, "diff": "\n".join(diff_lines)}
-                )
-                continue
-            if line.startswith("*** Delete File: "):
-                path = line.replace("*** Delete File: ", "", 1).strip()
-                operations.append({"type": "delete_file", "path": path})
-            idx += 1
-        return operations
+    # ------------------------------------------------------------------
+    # Message helpers
+    # ------------------------------------------------------------------
 
     def _append_user_message(self, message: str) -> None:
         self._entries.append({"role": "user", "content": message})
         self._render_entries()
 
-    def _append_assistant_message(self, message: str, tool_calls: list[dict[str, Any]]) -> None:
-        self._entries.append(
-            {"role": "assistant", "content": message, "tool_calls": tool_calls}
-        )
-        self._render_entries()
-
-    def _append_assistant_renderable(self, renderable: Any, tool_calls: list[dict[str, Any]]) -> None:
-        self._entries.append(
-            {"role": "assistant", "renderables": [renderable], "tool_calls": tool_calls}
-        )
-        self._render_entries()
-
     def _append_system_message(self, message: str) -> None:
-        self._entries.append({"role": "system", "content": f"[bold red]{message}[/bold red]"})
+        self._entries.append(
+            {"role": "system", "content": f"[bold red]{message}[/bold red]"}
+        )
         self._render_entries()
 
-    def _format_lines(self, message: str, background: str | None = None) -> list[str]:
-        """Format chat message lines for display."""
-        lines = message.splitlines() if message else [""]
-        formatted: list[str] = []
-        for line in lines:
-            if line.startswith("- "):
-                formatted.append(self._wrap_line(f"- {line[2:]}", background))
-            elif line.strip() == "":
-                formatted.append(self._wrap_line("", background))
-            else:
-                formatted.append(self._wrap_line(f"{line}", background))
-        return formatted
-
-    def _wrap_line(
-        self,
-        text: str,
-        background: str | None = None,
-        style: str | None = None,
-    ) -> str:
-        if not background and not style:
-            return text
-        width = self._log_width()
-        padded = text.ljust(width) if width > 0 else text
-        if background and style:
-            return f"[{background}][{style}]{padded}[/][/{background}]"
-        if background:
-            return f"[{background}]{padded}[/]"
-        return f"[{style}]{padded}[/]"
-
-    def _write_log(self, line: str) -> None:
-        log = self.query_one("#chat-log", RichLog)
-        log.write(line)
-
-    def _restore_state(self) -> None:
-        self._history = getattr(self.app, "chat_history", [])
-        self._entries = getattr(self.app, "chat_entries", [])
-
-    def _persist_state(self) -> None:
-        self.app.chat_history = self._history
-        self.app.chat_entries = self._entries
+    # ------------------------------------------------------------------
+    # Processing spinner
+    # ------------------------------------------------------------------
 
     def _start_processing(self) -> None:
         self._processing_frame = 0
@@ -688,75 +547,64 @@ class ChatScreen(Screen):
         if self._processing_timer:
             self._processing_timer.stop()
             self._processing_timer = None
-        self._remove_processing_placeholder()
-        return
 
     def _tick_processing(self) -> None:
-        self._processing_frame = (self._processing_frame + 1) % 4
-        if self._pending_index is not None:
-            self._entries[self._pending_index]["content"] = self._processing_text()
+        self._processing_frame = (self._processing_frame + 1) % 8
+        if self._entries and self._entries[-1].get("role") == "pending":
+            tool_suffix = ""
+            if self._current_tool:
+                display_name = self._format_tool_name(self._current_tool)
+                tool_suffix = f" [cyan]{display_name}...[/cyan]"
+            self._entries[-1]["content"] = self._processing_text() + tool_suffix
             self._render_entries()
 
     def _processing_text(self) -> str:
-        spinner = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+        spinner = ["\u28fe", "\u28fd", "\u28fb", "\u28bf", "\u287f", "\u28df", "\u28ef", "\u28f7"]
         return f"{spinner[self._processing_frame % len(spinner)]} Thinking..."
 
-    def _log_width(self) -> int:
-        log = self.query_one("#chat-log", RichLog)
-        return log.size.width or log.min_width
-
-    # status display removed
-
     def _append_processing_placeholder(self) -> None:
-        """Append a placeholder assistant response with animation."""
-        if self._pending_index is not None:
-            return
-        self._pending_index = len(self._entries)
         self._entries.append({"role": "pending", "content": self._processing_text()})
         self._render_entries()
 
     def _remove_processing_placeholder(self) -> None:
-        """Remove the placeholder assistant response."""
-        if self._pending_index is None:
-            return
-        self._entries.pop(self._pending_index)
-        self._pending_index = None
-        self._render_entries()
+        if self._entries and self._entries[-1].get("role") == "pending":
+            self._entries.pop()
+            self._render_entries()
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
 
     def _render_entries(self) -> None:
-        """Re-render the log from stored entries."""
         log = self.query_one("#chat-log", RichLog)
         log.clear()
+
         for entry in self._entries:
             role = entry.get("role")
             content = entry.get("content", "")
+
             if role == "system":
                 log.write(content)
-                continue
-            if role == "user":
+            elif role == "user":
                 self._render_user_block(log, content)
-                continue
-            if role == "assistant":
+            elif role == "entity":
                 log.write("")
-                renderables = entry.get("renderables")
-                if renderables:
-                    for renderable in renderables:
-                        log.write(renderable)
-                else:
-                    for line in self._format_lines(content):
-                        log.write(line)
-                tool_calls = entry.get("tool_calls") or []
-                if tool_calls:
-                    tool_list = ", ".join(call.get("name", "tool") for call in tool_calls)
+                log.write(content)
+            elif role == "diff":
                 log.write("")
-                log.write("")
-                continue
-            if role == "pending":
+                renderable = entry.get("renderable")
+                if renderable:
+                    log.write(renderable)
+            elif role in ("assistant", "assistant_streaming"):
                 log.write("")
                 for line in self._format_lines(content):
                     log.write(line)
                 log.write("")
+            elif role == "pending":
                 log.write("")
+                log.write(content)
+                log.write("")
+
         self._persist_state()
 
     def _render_user_block(self, log: RichLog, message: str) -> None:
@@ -768,3 +616,30 @@ class ChatScreen(Screen):
             prefix = "> " if idx == 0 else ""
             log.write(self._wrap_line(f"{prefix}{line}", background=bg))
         log.write(self._wrap_line("", background=bg))
+
+    def _format_lines(self, message: str) -> list[str]:
+        lines = message.splitlines() if message else [""]
+        return lines
+
+    def _wrap_line(self, text: str, background: str | None = None) -> str:
+        if not background:
+            return text
+        width = self._log_width()
+        padded = text.ljust(width) if width > 0 else text
+        return f"[{background}]{padded}[/]"
+
+    def _log_width(self) -> int:
+        log = self.query_one("#chat-log", RichLog)
+        return log.size.width or log.min_width
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _restore_state(self) -> None:
+        self._history = getattr(self.app, "chat_history", [])
+        self._entries = getattr(self.app, "chat_entries", [])
+
+    def _persist_state(self) -> None:
+        self.app.chat_history = self._history
+        self.app.chat_entries = self._entries

@@ -1,63 +1,21 @@
 """Polymarket agent screen with streaming responses."""
 
-import difflib
-import json
-from pathlib import Path
 from typing import Any
 
-import requests
-from agents import apply_diff as agents_apply_diff
-from rich.console import Group
-from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Input, RichLog, Static
+from textual.widgets import Footer, Header, Input, RichLog
 
-from wangr.config import API_TIMEOUT, POLYMARKET_CHAT_API_URL
-from wangr.settings import get_api_key
-
-
-class EntityCard(Static):
-    """Display card for extracted entities."""
-
-    def __init__(self, entity_type: str, entities: list[dict[str, Any]]) -> None:
-        super().__init__()
-        self.entity_type = entity_type
-        self.entities = entities
-
-    def render(self) -> str:
-        if not self.entities:
-            return ""
-
-        lines = []
-        icon = {"markets": "📊", "events": "📅", "users": "👤"}.get(self.entity_type, "•")
-        title = self.entity_type.title()
-        lines.append(f"[bold]{icon} {title}[/bold]")
-
-        for entity in self.entities[:5]:  # Limit to 5
-            if self.entity_type == "markets":
-                question = entity.get("question", entity.get("slug", "Unknown"))
-                if len(question) > 50:
-                    question = question[:47] + "..."
-                lines.append(f"  • {question}")
-            elif self.entity_type == "events":
-                title = entity.get("title", entity.get("slug", "Unknown"))
-                if len(title) > 50:
-                    title = title[:47] + "..."
-                lines.append(f"  • {title}")
-            elif self.entity_type == "users":
-                username = entity.get("username", entity.get("wallet", "Unknown")[:12])
-                lines.append(f"  • {username}")
-
-        if len(self.entities) > 5:
-            lines.append(f"  [dim]... and {len(self.entities) - 5} more[/dim]")
-
-        return "\n".join(lines)
+from wangr.config import POLYMARKET_CHAT_API_URL
+from wangr.context_store import prepend_context_to_message
+from wangr.entity_metadata import enrich_entities_in_background
+from wangr.file_ops_mixin import FileOpsMixin
+from wangr.stream_handler import iter_ndjson_events, should_suppress_status, stream_post
 
 
-class PolymarketAgentScreen(Screen):
+class PolymarketAgentScreen(FileOpsMixin, Screen):
     """Streaming chat screen for Polymarket queries."""
 
     BINDINGS = [
@@ -76,7 +34,7 @@ class PolymarketAgentScreen(Screen):
         self._entities: dict[str, list[dict[str, Any]]] = {}
         self._processing_timer = None
         self._processing_frame = 0
-        # File operations state
+        # File operations state (required by FileOpsMixin)
         self._pending_file_ops: dict[str, Any] | None = None
         self._pending_requires_approval = False
         self._auto_approve_chain = False
@@ -120,6 +78,10 @@ class PolymarketAgentScreen(Screen):
         self._auto_approve_chain = False
         self._render_entries()
         self._persist_state()
+
+    # ------------------------------------------------------------------
+    # Input handling
+    # ------------------------------------------------------------------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         message = event.value.strip()
@@ -169,6 +131,10 @@ class PolymarketAgentScreen(Screen):
             name="polymarket_pending",
         )
 
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
     def _start_streaming(self, message: str) -> None:
         """Start streaming request in a worker thread."""
         self._streaming = True
@@ -185,23 +151,15 @@ class PolymarketAgentScreen(Screen):
     def _stream_request(self, message: str) -> tuple[str, list[dict[str, Any]]]:
         """Execute streaming request and process events."""
         try:
-            headers = {"Content-Type": "application/json"}
-            api_key = get_api_key()
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-
-            response = requests.post(
+            enriched_message = prepend_context_to_message(message)
+            response = stream_post(
                 POLYMARKET_CHAT_API_URL,
-                json={"message": message, "history": self._history},
-                headers=headers,
-                timeout=API_TIMEOUT * 12,
-                stream=True,
+                {"message": enriched_message, "history": self._history},
             )
-            response.raise_for_status()
 
             full_text, tool_calls = self._process_stream_response(response)
 
-            # Update history
+            # Store original message (without context prefix) in history
             self._history.append({"role": "user", "content": message})
             self._history.append({"role": "assistant", "content": full_text})
 
@@ -211,34 +169,70 @@ class PolymarketAgentScreen(Screen):
             self.app.call_from_thread(self._handle_error, str(exc))
             raise RuntimeError("stream request failed") from exc
 
-    def _process_stream_response(self, response) -> tuple[str, list[dict[str, Any]]]:
+    def _process_stream_response(
+        self, response
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Process streaming response and return full text and tool calls."""
         full_text = ""
         tool_calls: list[dict[str, Any]] = []
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line or not line.strip():
-                continue
-            try:
-                event = json.loads(line)
+        for event in iter_ndjson_events(response):
+            # Check for pending_file_ops event
+            if event.get("type") == "pending_file_ops":
+                self.app.call_from_thread(self._handle_pending_file_ops, event)
+                return full_text, tool_calls
 
-                # Check for pending_file_ops event
-                if event.get("type") == "pending_file_ops":
-                    self.app.call_from_thread(self._handle_pending_file_ops, event)
-                    # Stop processing this stream - will continue after approval
-                    return full_text, tool_calls
+            self._process_stream_event(event)
 
-                self._process_stream_event(event)
-
-                # Collect final data
-                if event.get("type") == "text_delta":
-                    full_text += event.get("content", "")
-                elif event.get("type") == "done":
-                    tool_calls = event.get("tool_calls", [])
-            except json.JSONDecodeError:
-                continue
+            if event.get("type") == "text_delta":
+                full_text += event.get("content", "")
+            elif event.get("type") == "text":
+                full_text = event.get("content", "")
+            elif event.get("type") == "done":
+                tool_calls = event.get("tool_calls", [])
 
         return full_text, tool_calls
+
+    def _process_stream_event(self, event: dict[str, Any]) -> None:
+        """Process a single stream event (called from worker thread)."""
+        event_type = event.get("type")
+
+        if event_type == "status":
+            msg = event.get("message", "")
+            if not should_suppress_status(msg):
+                self.app.call_from_thread(self._update_status, msg)
+
+        elif event_type == "tool_start":
+            self.app.call_from_thread(self._show_tool_start, event.get("name", "Tool"))
+
+        elif event_type == "tool_end":
+            self.app.call_from_thread(
+                self._show_tool_end,
+                event.get("name", "Tool"),
+                event.get("duration", 0),
+                event.get("entities", {}),
+            )
+
+        elif event_type == "text_start":
+            self.app.call_from_thread(self._start_text_display)
+
+        elif event_type == "text_delta":
+            self.app.call_from_thread(self._append_text_delta, event.get("content", ""))
+
+        elif event_type == "text_end":
+            self.app.call_from_thread(self._finish_text_display)
+
+        elif event_type == "done":
+            self.app.call_from_thread(self._finish_streaming, event.get("duration", 0))
+
+        elif event_type == "error":
+            self.app.call_from_thread(
+                self._handle_error, event.get("message", "Unknown error")
+            )
+
+    # ------------------------------------------------------------------
+    # File ops (using FileOpsMixin)
+    # ------------------------------------------------------------------
 
     def _handle_pending_file_ops(self, event: dict[str, Any]) -> None:
         """Handle pending file operations event."""
@@ -246,410 +240,105 @@ class PolymarketAgentScreen(Screen):
             "id": event.get("id"),
             "operations": event.get("operations", []),
         }
-        self._streaming = False  # Allow input for Y/N approval
+        self._streaming = False
         self._stop_processing()
         self._remove_processing_placeholder()
 
-        # Prepare and show approval prompt
         prompt = self._prepare_pending_prompt(self._pending_file_ops)
         if prompt:
             self._entries.append({"role": "assistant", "content": prompt})
             self._render_entries()
 
-        # Enable input for Y/N
         input_box = self.query_one("#polymarket-input", Input)
         input_box.disabled = False
         input_box.focus()
 
-    def _prepare_pending_prompt(self, pending: dict[str, Any]) -> str:
-        """Prepare the approval prompt with diff preview."""
-        preview, approvable, _auto_outputs = self._categorize_patch_ops(pending)
-        self._pending_requires_approval = bool(approvable)
-
-        if preview:
-            renderable = Group(
-                Text("Proposed changes:", style="bold"),
-                self._render_diff(preview),
-            )
-            self._entries.append({"role": "diff", "renderable": renderable})
-        elif approvable:
-            self._entries.append({
-                "role": "system",
-                "content": "[dim]Proposed changes (no diff preview available).[/dim]"
-            })
-
-        if approvable:
-            return "Apply these changes? [bold]Y[/bold]/[bold]N[/bold]"
-        return ""
-
-    def _categorize_patch_ops(
-        self, pending: dict[str, Any]
-    ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
-        """Categorize patch operations into preview, approvable, and auto outputs."""
-        previews = []
-        approvable = []
-        auto_outputs = []
-        base_dir = Path.cwd()
-
-        for op in pending.get("operations", []):
-            if op.get("type") not in ("apply_patch", "read_file"):
-                continue
-
-            # Handle read_file operations automatically
-            if op.get("type") == "read_file":
-                continue
-
-            call_id = op.get("call_id")
-            operation = op.get("operation", op)
-            op_type = operation.get("type")
-
-            try:
-                diff = self._preview_operation(operation, base_dir)
-                if diff:
-                    previews.append(diff)
-                if op_type in {"create_file", "update_file", "delete_file"}:
-                    approvable.append(op)
-            except Exception as exc:
-                path = operation.get("path", "<unknown>")
-                auto_outputs.append({
-                    "call_id": call_id,
-                    "status": "failed",
-                    "output": f"Preview error for {path}: {exc}",
-                })
-
-        return "\n\n".join(previews), approvable, auto_outputs
-
-    def _preview_operation(self, operation: dict[str, Any], base_dir: Path) -> str:
-        """Generate diff preview for an operation."""
-        op = self._normalize_operation(operation)
-        target = self._resolve_path(base_dir, op["path"])
-
-        if op["type"] == "delete_file":
-            if not target.exists():
-                raise ValueError(f"File not found: {op['path']}")
-            old_content = target.read_text()
-            new_content = ""
-        elif op["type"] == "create_file":
-            if target.exists():
-                raise ValueError(f"File already exists: {op['path']}")
-            old_content = ""
-            new_content = self._apply_diff("", op.get("diff") or "", mode="create")
-        elif op["type"] == "update_file":
-            if not target.exists():
-                raise ValueError(f"File not found: {op['path']}")
-            old_content = target.read_text()
-            new_content = self._apply_diff(old_content, op.get("diff") or "")
-        else:
-            raise ValueError(f"Unsupported operation type: {op['type']}")
-
-        if old_content == new_content:
-            return ""
-
-        old_lines = old_content.splitlines()
-        new_lines = new_content.splitlines()
-        to_name = op["path"] if op["type"] != "delete_file" else "(deleted)"
-        diff_lines = difflib.unified_diff(
-            old_lines,
-            new_lines,
-            fromfile=op["path"],
-            tofile=to_name,
-            lineterm="",
-        )
-        return "\n".join(diff_lines)
-
-    def _render_diff(self, preview: str) -> Group:
-        """Render a diff with theme-matching colors."""
-        lines = preview.splitlines()
-        width = len(str(len(lines))) if lines else 1
-        rendered = []
-        for idx, line in enumerate(lines, start=1):
-            text = Text()
-            text.append(f"{idx:>{width}} ", style="dim")
-            if line.startswith("+++") or line.startswith("---"):
-                text.append(line, style="dim")
-            elif line.startswith("@@"):
-                text.append(line, style="cyan")
-            elif line.startswith("+"):
-                text.append(line, style="green")
-            elif line.startswith("-"):
-                text.append(line, style="red")
-            else:
-                text.append(line, style="white")
-            rendered.append(text)
-        return Group(*rendered)
-
-    def _normalize_operation(self, operation: dict[str, Any]) -> dict[str, Any]:
-        """Normalize operation format."""
-        if "operation" in operation and isinstance(operation["operation"], dict):
-            operation = operation["operation"]
-        op_type = operation.get("type")
-        path = operation.get("path")
-        if not op_type or not path:
-            raise ValueError("Operation must include 'type' and 'path'.")
-        return {"type": op_type, "path": path, "diff": operation.get("diff")}
-
-    def _resolve_path(self, base_dir: Path, path: str) -> Path:
-        """Resolve and validate path within workspace."""
-        candidate = Path(path)
-        if candidate.is_absolute():
-            raise ValueError("Absolute paths are not allowed.")
-        resolved = (base_dir / candidate).resolve()
-        if not resolved.is_relative_to(base_dir.resolve()):
-            raise ValueError("Path escapes the workspace root.")
-        return resolved
-
-    def _sanitize_diff(self, diff: str) -> str:
-        """Remove patch markers from diff."""
-        lines = []
-        for line in diff.splitlines():
-            if line.startswith("*** Begin Patch") or line.startswith("*** End Patch"):
-                continue
-            if line.startswith("*** Update File") or line.startswith("*** Add File") or line.startswith("*** Delete File"):
-                continue
-            if line.startswith("diff --git") or line.startswith("index "):
-                continue
-            if line.startswith("--- ") or line.startswith("+++ "):
-                continue
-            lines.append(line)
-        return "\n".join(lines)
-
-    def _apply_diff(self, input_text: str, diff: str, mode: str = "default") -> str:
-        """Apply diff to input text."""
-        return agents_apply_diff(input_text, self._sanitize_diff(diff), mode)
-
-    def _apply_operation(self, operation: dict[str, Any], base_dir: Path) -> tuple[bool, str]:
-        """Apply a file operation."""
-        try:
-            op = self._normalize_operation(operation)
-            target = self._resolve_path(base_dir, op["path"])
-
-            if op["type"] == "delete_file":
-                if not target.exists():
-                    return False, f"File not found: {op['path']}"
-                target.unlink()
-                return True, f"Deleted {op['path']}"
-            if op["type"] == "create_file":
-                if target.exists():
-                    return False, f"File already exists: {op['path']}"
-                content = self._apply_diff("", op.get("diff") or "", mode="create")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content)
-                return True, f"Created {op['path']}"
-            if op["type"] == "update_file":
-                if not target.exists():
-                    return False, f"File not found: {op['path']}"
-                old_content = target.read_text()
-                new_content = self._apply_diff(old_content, op.get("diff") or "")
-                if new_content != old_content:
-                    target.write_text(new_content)
-                return True, f"Updated {op['path']}"
-            return False, f"Unsupported operation type: {op['type']}"
-        except Exception as exc:
-            return False, str(exc)
-
-    def _resolve_pending_request(self, approved: bool) -> tuple[str, list[dict[str, Any]]]:
-        """Resolve pending file operations."""
+    def _resolve_pending_request(
+        self, approved: bool
+    ) -> tuple[str, list[dict[str, Any]]]:
         pending = self._pending_file_ops
         if not pending:
             return "No pending operations.", []
 
-        response, next_pending, new_auto_approve = self._resolve_pending(
-            pending, approved, self._auto_approve_chain
+        response, next_pending, new_auto = self._resolve_pending_core(
+            pending, approved, self._auto_approve_chain, self._stream_continue_request
         )
 
         self._pending_file_ops = next_pending
-        self._auto_approve_chain = new_auto_approve
+        self._auto_approve_chain = new_auto
         if not next_pending:
             self._pending_requires_approval = False
             self._auto_approve_chain = False
 
         return response, []
 
-    def _resolve_pending(
-        self, pending: dict[str, Any], approved: bool, auto_approve_chain: bool
-    ) -> tuple[str, dict[str, Any] | None, bool]:
-        """Execute pending operations and continue streaming."""
-        pending_id = pending.get("id")
-        operations = pending.get("operations", [])
-
-        if not pending_id:
-            raise ValueError("Missing pending operation id.")
-
-        read_ops = [op for op in operations if op.get("type") == "read_file"]
-        patch_ops = [op for op in operations if op.get("type") == "apply_patch"]
-
-        outputs = []
-        auto_outputs = []
-
-        if read_ops:
-            outputs.extend(self._execute_read_ops(read_ops))
-
-        if patch_ops:
-            _preview, approvable, auto_outputs = self._categorize_patch_ops(pending)
-            outputs.extend(auto_outputs)
-
-            if approvable:
-                if approved or auto_approve_chain:
-                    outputs.extend(self._apply_patch_ops(approvable))
-                else:
-                    outputs.extend(self._deny_operations(approvable, "User denied operation."))
-
-        # Call continue endpoint with streaming
-        response, next_pending = self._stream_continue_request(pending_id, outputs)
-        return response, next_pending, auto_approve_chain or (approved and bool(patch_ops) and not auto_outputs)
-
-    def _execute_read_ops(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Execute read file operations."""
-        results = []
-        base_dir = Path.cwd()
-        for op in operations:
-            call_id = op.get("call_id")
-            path = op.get("path", "")
-            try:
-                resolved = self._resolve_path(base_dir, path)
-                content = resolved.read_text()
-                results.append({
-                    "call_id": call_id,
-                    "status": "completed",
-                    "output": content,
-                })
-            except Exception as exc:
-                results.append({
-                    "call_id": call_id,
-                    "status": "failed",
-                    "output": f"Error reading file: {exc}",
-                })
-        return results
-
-    def _apply_patch_ops(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Apply patch operations."""
-        results = []
-        base_dir = Path.cwd()
-        for op in operations:
-            call_id = op.get("call_id")
-            operation = op.get("operation", op)
-            success, output = self._apply_operation(operation, base_dir)
-            results.append({
-                "call_id": call_id,
-                "status": "completed" if success else "failed",
-                "output": output,
-            })
-        return results
-
-    def _deny_operations(self, operations: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
-        """Deny operations with a reason."""
-        return [{
-            "call_id": op.get("call_id"),
-            "status": "failed",
-            "output": reason,
-        } for op in operations]
-
     def _stream_continue_request(
         self, pending_id: str, tool_outputs: list[dict[str, Any]]
     ) -> tuple[str, dict[str, Any] | None]:
         """Stream the continue request response."""
-        headers = {"Content-Type": "application/json"}
-        api_key = get_api_key()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        response = requests.post(
+        response = stream_post(
             f"{POLYMARKET_CHAT_API_URL}/continue",
-            json={"pending_id": pending_id, "tool_outputs": tool_outputs},
-            headers=headers,
-            timeout=API_TIMEOUT * 12,
-            stream=True,
+            {"pending_id": pending_id, "tool_outputs": tool_outputs},
         )
-        response.raise_for_status()
 
         full_text = ""
         next_pending = None
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line or not line.strip():
-                continue
-            try:
-                event = json.loads(line)
+        for event in iter_ndjson_events(response):
+            if event.get("type") == "pending_file_ops":
+                next_pending = {
+                    "id": event.get("id"),
+                    "operations": event.get("operations", []),
+                }
+                self.app.call_from_thread(self._handle_pending_file_ops, event)
+                return full_text, next_pending
 
-                # Check for another pending_file_ops
-                if event.get("type") == "pending_file_ops":
-                    next_pending = {
-                        "id": event.get("id"),
-                        "operations": event.get("operations", []),
-                    }
-                    self.app.call_from_thread(self._handle_pending_file_ops, event)
-                    return full_text, next_pending
+            self._process_stream_event(event)
 
-                self._process_stream_event(event)
-
-                if event.get("type") == "text_delta":
-                    full_text += event.get("content", "")
-            except json.JSONDecodeError:
-                continue
+            if event.get("type") == "text_delta":
+                full_text += event.get("content", "")
 
         return full_text, None
 
-    def _process_stream_event(self, event: dict[str, Any]) -> None:
-        """Process a single stream event (called from worker thread)."""
-        event_type = event.get("type")
-
-        if event_type == "status":
-            self.app.call_from_thread(self._update_status, event.get("message", ""))
-
-        elif event_type == "tool_start":
-            tool_name = event.get("name", "Tool")
-            self.app.call_from_thread(self._show_tool_start, tool_name)
-
-        elif event_type == "tool_end":
-            tool_name = event.get("name", "Tool")
-            duration = event.get("duration", 0)
-            entities = event.get("entities", {})
-            self.app.call_from_thread(self._show_tool_end, tool_name, duration, entities)
-
-        elif event_type == "text_start":
-            self.app.call_from_thread(self._start_text_display)
-
-        elif event_type == "text_delta":
-            content = event.get("content", "")
-            self.app.call_from_thread(self._append_text_delta, content)
-
-        elif event_type == "text_end":
-            self.app.call_from_thread(self._finish_text_display)
-
-        elif event_type == "done":
-            duration = event.get("duration", 0)
-            self.app.call_from_thread(self._finish_streaming, duration)
-
-        elif event_type == "error":
-            message = event.get("message", "Unknown error")
-            self.app.call_from_thread(self._handle_error, message)
+    # ------------------------------------------------------------------
+    # UI callbacks
+    # ------------------------------------------------------------------
 
     def _update_status(self, message: str) -> None:
-        """Update status message in the log."""
         if self._entries and self._entries[-1].get("role") == "pending":
             self._entries[-1]["content"] = f"{self._processing_text()} {message}"
             self._render_entries()
 
     def _show_tool_start(self, tool_name: str) -> None:
-        """Show tool start indicator."""
         self._current_tool = tool_name
         display_name = self._format_tool_name(tool_name)
         if self._entries and self._entries[-1].get("role") == "pending":
-            self._entries[-1]["content"] = f"{self._processing_text()} [cyan]{display_name}...[/cyan]"
+            self._entries[-1]["content"] = (
+                f"{self._processing_text()} [cyan]{display_name}...[/cyan]"
+            )
             self._render_entries()
 
     def _show_tool_end(
         self, tool_name: str, duration: float, entities: dict[str, Any]
     ) -> None:
-        """Show tool completion and extract entities."""
         self._current_tool = None
 
-        # Merge entities
-        for key in ["markets", "events", "users"]:
+        # Merge entities (all 5 types)
+        for key in ["markets", "events", "users", "symbols", "tokens"]:
             if key in entities and entities[key]:
                 if key not in self._entities:
                     self._entities[key] = []
                 self._entities[key].extend(entities[key])
+
+        # Launch background metadata enrichment for polymarket entities
+        if any(entities.get(k) for k in ["markets", "events", "users"]):
+            self.run_worker(
+                lambda: enrich_entities_in_background(
+                    entities, self._on_entity_enriched
+                ),
+                thread=True,
+                name="polymarket_enrich",
+            )
 
         display_name = self._format_tool_name(tool_name)
         if self._entries and self._entries[-1].get("role") == "pending":
@@ -658,8 +347,17 @@ class PolymarketAgentScreen(Screen):
             )
             self._render_entries()
 
+    def _on_entity_enriched(
+        self, entity_type: str, key: str, metadata: dict[str, Any]
+    ) -> None:
+        """Callback from metadata enrichment worker."""
+        entities = self._entities.get(entity_type, [])
+        for e in entities:
+            entity_key = e.get("slug") or e.get("wallet") or e.get("id")
+            if entity_key == key:
+                e.update(metadata)
+
     def _format_tool_name(self, tool_name: str) -> str:
-        """Format tool name for display."""
         name_map = {
             "search_gamma_markets": "Searching markets",
             "get_gamma_markets": "Fetching markets",
@@ -683,44 +381,80 @@ class PolymarketAgentScreen(Screen):
         return name_map.get(tool_name, tool_name.replace("_", " ").title())
 
     def _start_text_display(self) -> None:
-        """Start displaying streamed text."""
         self._stop_processing()
         self._current_text = ""
-        # Remove pending placeholder
         if self._entries and self._entries[-1].get("role") == "pending":
             self._entries.pop()
 
-        # Add entity cards if we have entities
         if self._entities:
             self._append_entities_display()
 
-        # Start new assistant entry for streaming text
         self._entries.append({"role": "assistant_streaming", "content": ""})
         self._render_entries()
 
     def _append_text_delta(self, content: str) -> None:
-        """Append text delta to current streaming response."""
         self._current_text += content
         if self._entries and self._entries[-1].get("role") == "assistant_streaming":
             self._entries[-1]["content"] = self._current_text
             self._render_entries()
 
     def _finish_text_display(self) -> None:
-        """Finish text display."""
         if self._entries and self._entries[-1].get("role") == "assistant_streaming":
             self._entries[-1]["role"] = "assistant"
             self._render_entries()
 
+    def _finish_streaming(self, duration: float) -> None:
+        self._streaming = False
+        self._stop_processing()
+        self._persist_state()
+
+        input_box = self.query_one("#polymarket-input", Input)
+        input_box.disabled = False
+        input_box.focus()
+
+    def _handle_error(self, message: str) -> None:
+        self._streaming = False
+        self._stop_processing()
+        self._remove_processing_placeholder()
+        self._append_system_message(f"Error: {message}")
+
+        input_box = self.query_one("#polymarket-input", Input)
+        input_box.disabled = False
+        input_box.focus()
+
+    def on_worker_state_changed(self, event) -> None:
+        if event.worker.name not in (
+            "polymarket_stream",
+            "polymarket_pending",
+            "polymarket_enrich",
+        ):
+            return
+
+        if event.state.name == "ERROR" and event.worker.name != "polymarket_enrich":
+            self._streaming = False
+            self._stop_processing()
+            input_box = self.query_one("#polymarket-input", Input)
+            input_box.disabled = False
+            input_box.focus()
+
+    # ------------------------------------------------------------------
+    # Entity display
+    # ------------------------------------------------------------------
+
     def _append_entities_display(self) -> None:
-        """Add entity display cards."""
-        for entity_type in ["markets", "events", "users"]:
+        for entity_type in ["markets", "events", "users", "symbols", "tokens"]:
             entities = self._entities.get(entity_type, [])
             if entities:
-                # Deduplicate by id/slug/wallet
-                seen = set()
-                unique = []
+                seen: set[str] = set()
+                unique: list[dict[str, Any]] = []
                 for e in entities:
-                    key = e.get("id") or e.get("slug") or e.get("wallet") or str(e)
+                    key = (
+                        e.get("id")
+                        or e.get("slug")
+                        or e.get("wallet")
+                        or e.get("symbol")
+                        or str(e)
+                    )
                     if key not in seen:
                         seen.add(key)
                         unique.append(e)
@@ -728,13 +462,20 @@ class PolymarketAgentScreen(Screen):
                 card_content = self._format_entity_card(entity_type, unique)
                 self._entries.append({"role": "entity", "content": card_content})
 
-    def _format_entity_card(self, entity_type: str, entities: list[dict[str, Any]]) -> str:
-        """Format entities for display."""
+    def _format_entity_card(
+        self, entity_type: str, entities: list[dict[str, Any]]
+    ) -> str:
         if not entities:
             return ""
 
-        lines = []
-        icon = {"markets": "📊", "events": "📅", "users": "👤"}.get(entity_type, "•")
+        lines: list[str] = []
+        icon = {
+            "markets": "📊",
+            "events": "📅",
+            "users": "👤",
+            "symbols": "📈",
+            "tokens": "🪙",
+        }.get(entity_type, "•")
         title = entity_type.title()
         lines.append(f"[bold cyan]{icon} {title} Found[/bold cyan]")
 
@@ -753,57 +494,51 @@ class PolymarketAgentScreen(Screen):
                 username = entity.get("username") or entity.get("wallet", "")[:16]
                 pnl = entity.get("pnl")
                 if pnl is not None:
-                    pnl_str = f"[green]${pnl:,.0f}[/green]" if pnl >= 0 else f"[red]${pnl:,.0f}[/red]"
-                    lines.append(f"  [dim]•[/dim] {username} {pnl_str}")
+                    pnl_color = "green" if pnl >= 0 else "red"
+                    lines.append(
+                        f"  [dim]•[/dim] {username} [{pnl_color}]${pnl:,.0f}[/{pnl_color}]"
+                    )
                 else:
                     lines.append(f"  [dim]•[/dim] {username}")
+            elif entity_type == "symbols":
+                symbol = entity.get("symbol", "?")
+                price = entity.get("price")
+                change = entity.get("change_24h_pct")
+                price_str = f"${price:,.2f}" if price is not None else ""
+                change_str = ""
+                if change is not None:
+                    color = "green" if change >= 0 else "red"
+                    change_str = f" [{color}]{change:+.1f}%[/{color}]"
+                lines.append(f"  [dim]•[/dim] {symbol} {price_str}{change_str}")
+            elif entity_type == "tokens":
+                symbol = entity.get("symbol", "?")
+                name = entity.get("name", symbol)
+                price = entity.get("price")
+                price_str = f" ${price:,.4f}" if price is not None else ""
+                lines.append(f"  [dim]•[/dim] {name} ({symbol}){price_str}")
 
         if len(entities) > 5:
             lines.append(f"  [dim]... +{len(entities) - 5} more[/dim]")
 
         return "\n".join(lines)
 
-    def _finish_streaming(self, duration: float) -> None:
-        """Finish streaming response."""
-        self._streaming = False
-        self._stop_processing()
-        self._persist_state()
-
-        # Re-enable input
-        input_box = self.query_one("#polymarket-input", Input)
-        input_box.disabled = False
-        input_box.focus()
-
-    def _handle_error(self, message: str) -> None:
-        """Handle streaming error."""
-        self._streaming = False
-        self._stop_processing()
-        self._remove_processing_placeholder()
-        self._append_system_message(f"Error: {message}")
-
-        input_box = self.query_one("#polymarket-input", Input)
-        input_box.disabled = False
-        input_box.focus()
-
-    def on_worker_state_changed(self, event) -> None:
-        """Handle worker completion."""
-        if event.worker.name not in ("polymarket_stream", "polymarket_pending"):
-            return
-
-        if event.state.name == "ERROR":
-            self._streaming = False
-            self._stop_processing()
-            input_box = self.query_one("#polymarket-input", Input)
-            input_box.disabled = False
-            input_box.focus()
+    # ------------------------------------------------------------------
+    # Message helpers
+    # ------------------------------------------------------------------
 
     def _append_user_message(self, message: str) -> None:
         self._entries.append({"role": "user", "content": message})
         self._render_entries()
 
     def _append_system_message(self, message: str) -> None:
-        self._entries.append({"role": "system", "content": f"[bold red]{message}[/bold red]"})
+        self._entries.append(
+            {"role": "system", "content": f"[bold red]{message}[/bold red]"}
+        )
         self._render_entries()
+
+    # ------------------------------------------------------------------
+    # Processing spinner
+    # ------------------------------------------------------------------
 
     def _start_processing(self) -> None:
         self._processing_frame = 0
@@ -840,8 +575,11 @@ class PolymarketAgentScreen(Screen):
             self._entries.pop()
             self._render_entries()
 
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
     def _render_entries(self) -> None:
-        """Re-render the log from stored entries."""
         log = self.query_one("#polymarket-log", RichLog)
         log.clear()
 
@@ -895,6 +633,10 @@ class PolymarketAgentScreen(Screen):
     def _log_width(self) -> int:
         log = self.query_one("#polymarket-log", RichLog)
         return log.size.width or log.min_width
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
 
     def _restore_state(self) -> None:
         self._history = getattr(self.app, "polymarket_history", [])
