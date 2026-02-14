@@ -11,7 +11,7 @@ from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
 from textual.reactive import reactive
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label
+from textual.widgets import DataTable, Footer, Label
 from textual.worker import Worker
 
 from wangr.config import (
@@ -93,7 +93,6 @@ class PolymarketWhalesScreen(SortableTableMixin, Screen):
         self._positions_worker: Optional[Worker] = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Footer()
         yield Container(
             Container(

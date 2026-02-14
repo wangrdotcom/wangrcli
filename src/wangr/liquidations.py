@@ -2,7 +2,7 @@
 
 from textual.app import ComposeResult
 from textual.containers import Container
-from textual.widgets import Footer, Header, Label
+from textual.widgets import Footer, Label
 
 from wangr.base_screen import DataFetchingScreen
 from wangr.config import MILLION
@@ -21,7 +21,6 @@ class LiquidationsScreen(DataFetchingScreen):
 
     def compose(self) -> ComposeResult:
         """Compose the screen UI."""
-        yield Header()
         yield Footer()
         yield Container(id="liq-main")
 

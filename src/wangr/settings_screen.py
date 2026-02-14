@@ -3,7 +3,7 @@
 from textual.app import ComposeResult
 from textual.containers import Container, Vertical
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Header, Input, Label, Static
+from textual.widgets import Button, Footer, Input, Label, Static
 from textual.worker import Worker
 
 from wangr.settings import (
@@ -28,7 +28,6 @@ class SettingsScreen(Screen):
         self._on_key_validated = on_key_validated
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Footer()
         yield Container(
             Vertical(

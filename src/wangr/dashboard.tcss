@@ -688,9 +688,16 @@ SortModal {
 }
 
 /* Chat Screen */
-#chat-container {
+#chat-shell {
+    layout: horizontal;
     height: 100%;
     width: 100%;
+    padding: 0;
+}
+
+#chat-main {
+    width: 75%;
+    height: 100%;
     padding: 0;
 }
 
@@ -715,6 +722,31 @@ SortModal {
     margin: 0;
 }
 
+#chat-context-pane {
+    width: 25%;
+    height: 100%;
+    border-left: solid $panel;
+    background: $surface-darken-1;
+    padding: 0;
+}
+
+#chat-context-pane.context-focused {
+    border-left: tall $primary;
+}
+
+#chat-context-log {
+    height: 100%;
+    width: 100%;
+    border: none;
+    padding: 1;
+    margin: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+    scrollbar-background: $panel;
+    scrollbar-color: $primary;
+}
+
 #chat-status {
     height: 1;
     color: $accent;
@@ -723,9 +755,16 @@ SortModal {
 }
 
 /* Polymarket Agent Screen */
-#polymarket-container {
+#polymarket-shell {
+    layout: horizontal;
     height: 100%;
     width: 100%;
+    padding: 0;
+}
+
+#polymarket-main {
+    width: 75%;
+    height: 100%;
     padding: 0;
 }
 
@@ -748,6 +787,31 @@ SortModal {
     border: solid $panel;
     padding: 0 1;
     margin: 0;
+}
+
+#polymarket-context-pane {
+    width: 25%;
+    height: 100%;
+    border-left: solid $panel;
+    background: $surface-darken-1;
+    padding: 0;
+}
+
+#polymarket-context-pane.context-focused {
+    border-left: tall $primary;
+}
+
+#polymarket-context-log {
+    height: 100%;
+    width: 100%;
+    border: none;
+    padding: 1;
+    margin: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+    scrollbar-background: $panel;
+    scrollbar-color: $primary;
 }
 
 /* Loading Spinner Widget */

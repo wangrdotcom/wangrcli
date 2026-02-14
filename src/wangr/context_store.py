@@ -80,6 +80,24 @@ def unpin_entity(entity_type: str, entity_id: str) -> list[dict[str, Any]]:
     return pinned
 
 
+def update_pin_note(entity_type: str, entity_id: str, note: str) -> list[dict[str, Any]]:
+    """Update note for a pinned entity. Returns updated list."""
+    pinned = load_pinned()
+    updated: list[dict[str, Any]] = []
+    for p in pinned:
+        if p["type"] == entity_type and p["id"] == entity_id:
+            p = {**p, "note": note}
+        updated.append(p)
+    save_pinned(updated)
+    return updated
+
+
+def clear_pinned() -> list[dict[str, Any]]:
+    """Remove all pinned entities."""
+    save_pinned([])
+    return []
+
+
 # ------------------------------------------------------------------
 # Serialization for AI
 # ------------------------------------------------------------------

@@ -3,7 +3,7 @@
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
-from textual.widgets import Button, Footer, Header, Label, Static
+from textual.widgets import Button, Footer, Label, Static
 
 from wangr.arbitrage import ArbitrageScreen
 from wangr.base_screen import DataFetchingScreen
@@ -80,7 +80,6 @@ class DashboardScreen(DataFetchingScreen):
         self._focused_idx: int = 0
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Footer()
         yield LoadingSpinner("Fetching market data", id="dashboard-loading", classes="dashboard-loading")
         cards = []

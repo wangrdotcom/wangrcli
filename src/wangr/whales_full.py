@@ -9,7 +9,7 @@ from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
 from textual.reactive import reactive
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label, Static
+from textual.widgets import DataTable, Footer, Label, Static
 from textual.worker import Worker
 
 from wangr.config import (
@@ -222,7 +222,6 @@ class WhalesFullScreen(SortableTableMixin, Screen):
 
     def compose(self) -> ComposeResult:
         """Compose the screen UI."""
-        yield Header()
         yield Footer()
         yield Horizontal(
             Static("₿ BTC", id="coin-btc", classes="coin-toggle coin-toggle-active"),

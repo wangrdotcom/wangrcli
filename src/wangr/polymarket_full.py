@@ -12,7 +12,7 @@ from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
 from textual.reactive import reactive
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label, Static
+from textual.widgets import DataTable, Footer, Label, Static
 from textual.worker import Worker
 
 from wangr.api import ApiError, get_json, get_json_or_raise
@@ -64,7 +64,6 @@ class PolymarketFullScreen(Screen):
         self._data_worker: Optional[Worker] = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Footer()
         yield Horizontal(
             Static("₿ BTC", id="poly-coin-btc", classes="coin-toggle coin-toggle-active"),

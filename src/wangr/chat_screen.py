@@ -6,22 +6,24 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Input, RichLog
+from textual.widgets import Footer, Input, RichLog
 
 from wangr.config import CHAT_API_URL
+from wangr.context_commands_mixin import ContextCommandsMixin
 from wangr.context_store import prepend_context_to_message
 from wangr.entity_metadata import enrich_entities_in_background
 from wangr.file_ops_mixin import FileOpsMixin
 from wangr.stream_handler import iter_ndjson_events, should_suppress_status, stream_post
 
 
-class ChatScreen(FileOpsMixin, Screen):
+class ChatScreen(FileOpsMixin, ContextCommandsMixin, Screen):
     """Streaming chat screen for general crypto queries."""
 
     BINDINGS = [
         ("b", "go_back", "Go Back"),
         ("ctrl+b", "go_back", "Go Back"),
         ("ctrl+l", "clear_chat", "Clear Chat"),
+        ("f2", "toggle_context_focus", "Context Focus"),
     ]
 
     def __init__(self) -> None:
@@ -38,14 +40,25 @@ class ChatScreen(FileOpsMixin, Screen):
         self._pending_file_ops: dict[str, Any] | None = None
         self._pending_requires_approval = False
         self._auto_approve_chain = False
+        self._context_log_id = "#chat-context-log"
+        self._context_pane_id = "#chat-context-pane"
+        self._chat_input_id = "#chat-input"
+        self._default_trader_source_hint = "hl"
+        self._init_context_commands_state()
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Footer()
         yield Container(
-            RichLog(id="chat-log", wrap=True, highlight=True, markup=True),
-            Input(placeholder="Ask Wangr\u2026", id="chat-input"),
-            id="chat-container",
+            Container(
+                RichLog(id="chat-log", wrap=True, highlight=True, markup=True),
+                Input(placeholder="Ask Wangr\u2026", id="chat-input"),
+                id="chat-main",
+            ),
+            Container(
+                RichLog(id="chat-context-log", wrap=True, highlight=True, markup=True),
+                id="chat-context-pane",
+            ),
+            id="chat-shell",
         )
 
     async def on_mount(self) -> None:
@@ -60,36 +73,27 @@ class ChatScreen(FileOpsMixin, Screen):
             self._entries.append(
                 {
                     "role": "system",
-                    "content": "Ask about whales, markets, or wallets. [dim](Ctrl+L to clear)[/dim]\n",
+                    "content": (
+                        "Ask about whales, markets, or wallets. [dim](Ctrl+L to clear)[/dim]\n"
+                        "[dim]Context pane hotkeys are available in footer[/dim]\n"
+                    ),
                 }
             )
         self._render_entries()
+        self._render_context_pane()
         self.query_one("#chat-input", Input).focus()
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
-    def action_clear_chat(self) -> None:
-        self._history = []
-        self._entries = [
-            {
-                "role": "system",
-                "content": "[bold]\U0001f4ac Wangr Crypto Assistant[/bold]",
-            },
-            {"role": "system", "content": "\u2713 History cleared.\n"},
-        ]
-        self._entities = {}
-        self._pending_file_ops = None
-        self._pending_requires_approval = False
-        self._auto_approve_chain = False
-        self._render_entries()
-        self._persist_state()
 
     # ------------------------------------------------------------------
     # Input handling
     # ------------------------------------------------------------------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "chat-input":
+            return
         message = event.value.strip()
         if not message:
             return
@@ -118,6 +122,9 @@ class ChatScreen(FileOpsMixin, Screen):
 
     def on_key(self, event: events.Key) -> None:
         """Handle Y/N key press for file operation approval."""
+        if self._handle_context_focus_key(event.key):
+            event.stop()
+            return
         if not self._pending_file_ops or not self._pending_requires_approval:
             return
         if self._streaming:
@@ -147,6 +154,10 @@ class ChatScreen(FileOpsMixin, Screen):
         self._current_text = ""
         self._current_tool = None
         self._entities = {}
+        self._set_active_trader_source_hint(message)
+        self._clear_discovered_context()
+        self._render_context_pane()
+        self._append_context_send_indicator()
         self._start_processing()
         self.run_worker(
             lambda: self._stream_request(message),
@@ -257,6 +268,8 @@ class ChatScreen(FileOpsMixin, Screen):
             self._entries.append({"role": "assistant", "content": prompt})
             self._render_entries()
 
+        if self._context_focused:
+            self._set_context_focus(False)
         input_box = self.query_one("#chat-input", Input)
         input_box.disabled = False
         input_box.focus()
@@ -409,8 +422,11 @@ class ChatScreen(FileOpsMixin, Screen):
         self._persist_state()
 
         input_box = self.query_one("#chat-input", Input)
-        input_box.disabled = False
-        input_box.focus()
+        if self._context_focused:
+            input_box.disabled = True
+        else:
+            input_box.disabled = False
+            input_box.focus()
 
     def _handle_error(self, message: str) -> None:
         self._streaming = False
@@ -419,8 +435,11 @@ class ChatScreen(FileOpsMixin, Screen):
         self._append_system_message(f"Error: {message}")
 
         input_box = self.query_one("#chat-input", Input)
-        input_box.disabled = False
-        input_box.focus()
+        if self._context_focused:
+            input_box.disabled = True
+        else:
+            input_box.disabled = False
+            input_box.focus()
 
     def on_worker_state_changed(self, event) -> None:
         if event.worker.name not in ("chat_stream", "chat_pending", "chat_enrich"):
@@ -430,8 +449,11 @@ class ChatScreen(FileOpsMixin, Screen):
             self._streaming = False
             self._stop_processing()
             input_box = self.query_one("#chat-input", Input)
-            input_box.disabled = False
-            input_box.focus()
+            if self._context_focused:
+                input_box.disabled = True
+            else:
+                input_box.disabled = False
+                input_box.focus()
 
     # ------------------------------------------------------------------
     # Entity display
@@ -455,6 +477,7 @@ class ChatScreen(FileOpsMixin, Screen):
                         seen.add(key)
                         unique.append(e)
 
+                self._update_discovered_entities(entity_type, unique)
                 card_content = self._format_entity_card(entity_type, unique)
                 self._entries.append({"role": "entity", "content": card_content})
 
@@ -475,27 +498,27 @@ class ChatScreen(FileOpsMixin, Screen):
         title = entity_type.title()
         lines.append(f"[bold cyan]{icon} {title} Found[/bold cyan]")
 
-        for entity in entities[:5]:
+        for idx, entity in enumerate(entities[:5], start=1):
             if entity_type == "markets":
                 question = entity.get("question", entity.get("slug", "Unknown"))
                 if len(question) > 60:
                     question = question[:57] + "..."
-                lines.append(f"  [dim]\u2022[/dim] {question}")
+                lines.append(f"  [dim]{idx}.[/dim] {question}")
             elif entity_type == "events":
                 title_text = entity.get("title", entity.get("slug", "Unknown"))
                 if len(title_text) > 60:
                     title_text = title_text[:57] + "..."
-                lines.append(f"  [dim]\u2022[/dim] {title_text}")
+                lines.append(f"  [dim]{idx}.[/dim] {title_text}")
             elif entity_type == "users":
                 username = entity.get("username") or entity.get("wallet", "")[:16]
                 pnl = entity.get("pnl")
                 if pnl is not None:
                     pnl_color = "green" if pnl >= 0 else "red"
                     lines.append(
-                        f"  [dim]\u2022[/dim] {username} [{pnl_color}]${pnl:,.0f}[/{pnl_color}]"
+                        f"  [dim]{idx}.[/dim] {username} [{pnl_color}]${pnl:,.0f}[/{pnl_color}]"
                     )
                 else:
-                    lines.append(f"  [dim]\u2022[/dim] {username}")
+                    lines.append(f"  [dim]{idx}.[/dim] {username}")
             elif entity_type == "symbols":
                 symbol = entity.get("symbol", "?")
                 price = entity.get("price")
@@ -505,16 +528,17 @@ class ChatScreen(FileOpsMixin, Screen):
                 if change is not None:
                     color = "green" if change >= 0 else "red"
                     change_str = f" [{color}]{change:+.1f}%[/{color}]"
-                lines.append(f"  [dim]\u2022[/dim] {symbol} {price_str}{change_str}")
+                lines.append(f"  [dim]{idx}.[/dim] {symbol} {price_str}{change_str}")
             elif entity_type == "tokens":
                 symbol = entity.get("symbol", "?")
                 name = entity.get("name", symbol)
                 price = entity.get("price")
                 price_str = f" ${price:,.4f}" if price is not None else ""
-                lines.append(f"  [dim]\u2022[/dim] {name} ({symbol}){price_str}")
+                lines.append(f"  [dim]{idx}.[/dim] {name} ({symbol}){price_str}")
 
         if len(entities) > 5:
             lines.append(f"  [dim]... +{len(entities) - 5} more[/dim]")
+        lines.append("  [dim]Tip: F2 context focus, then g group, j/k select, p pin[/dim]")
 
         return "\n".join(lines)
 

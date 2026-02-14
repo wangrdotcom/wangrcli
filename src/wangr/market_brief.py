@@ -2,7 +2,7 @@
 
 from textual.app import ComposeResult
 from textual.containers import Container, HorizontalGroup, VerticalScroll
-from textual.widgets import Digits, Footer, Header, Label
+from textual.widgets import Digits, Footer, Label
 
 from wangr.base_screen import DataFetchingScreen
 from wangr.utils import safe_float
@@ -89,7 +89,6 @@ class MarketBriefScreen(DataFetchingScreen):
 
     def compose(self) -> ComposeResult:
         """Compose the screen UI."""
-        yield Header()
         yield Footer()
         yield VerticalScroll(
             CoinPrices(self.data),

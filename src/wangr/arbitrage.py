@@ -10,7 +10,7 @@ from textual.app import ComposeResult
 from textual.containers import Container, Horizontal
 from textual.reactive import reactive
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label, Static
+from textual.widgets import DataTable, Footer, Label, Static
 from textual.worker import Worker
 
 from wangr.api import get_json
@@ -94,7 +94,6 @@ class ArbitrageScreen(TableNavigationMixin, Screen):
                 self.health = cached.get("health")
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Footer()
         yield Container(
             Container(
